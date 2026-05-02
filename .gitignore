@@ -1,0 +1,8 @@
+build/
+release/
+.gradle/
+.hermes/
+.idea/
+.intellijPlatform/
+*.iml
+src/test/

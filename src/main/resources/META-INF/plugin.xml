@@ -1,0 +1,66 @@
+<idea-plugin>
+    <id>com.hermes.intellij</id>
+    <name>Hermes AI Assistant</name>
+    <vendor>Hermes</vendor>
+
+    <description><![CDATA[
+    Connect to your locally deployed Hermes Agent for AI-powered coding assistance.
+    Features: Chat panel, code context, streaming responses, code insert/replace.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Notifications -->
+        <notificationGroup id="Hermes AI Notifications"
+                           displayType="BALLOON"
+                           isLogByDefault="true"/>
+        
+        <!-- Tool Window -->
+        <toolWindow id="Hermes AI"
+                    anchor="right"
+                    factoryClass="com.hermes.intellij.toolwindow.HermesToolWindowFactory"
+                    icon="/icons/hermes_13.svg"/>
+
+        <!-- Application Services -->
+        <applicationService
+                serviceImplementation="com.hermes.intellij.api.HermesApiClient"/>
+        <applicationService
+                serviceImplementation="com.hermes.intellij.services.HermesSettingsState"/>
+
+        <!-- Project Services -->
+        <projectService
+                serviceImplementation="com.hermes.intellij.services.HermesChatService"/>
+        <projectService
+                serviceImplementation="com.hermes.intellij.services.SelectionContextService"/>
+
+        <!-- Settings -->
+        <applicationConfigurable
+                id="hermes.settings"
+                displayName="Hermes AI"
+                instance="com.hermes.intellij.settings.HermesSettingsConfigurable"/>
+    </extensions>
+
+    <actions>
+        <group id="HermesAI.EditorContextMenu" text="Hermes AI" popup="true"
+               icon="/icons/hermes_13.svg">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <action id="HermesAI.SendSelection"
+                    class="com.hermes.intellij.actions.SendSelectionAction"
+                    text="Send Selection to Hermes"
+                    description="Send selected code as context to Hermes AI chat">
+                <keyboard-shortcut keymap="$default" first-keystroke="alt shift H"/>
+            </action>
+            <action id="HermesAI.SendFile"
+                    class="com.hermes.intellij.actions.SendFileAction"
+                    text="Send File to Hermes"
+                    description="Send current file as context to Hermes AI chat"/>
+        </group>
+
+        <action id="HermesAI.NewChat"
+                class="com.hermes.intellij.actions.NewChatAction"
+                text="New Chat"
+                description="Start a new Hermes AI conversation"
+                icon="/icons/newchat_16.svg"/>
+    </actions>
+</idea-plugin>
