@@ -28,6 +28,7 @@ import javax.swing.*
 class ChatPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     val messageListPanel = MessageListPanel(project)
+    private var isStreaming = false
     val inputPanel: InputPanel
 
     private val titleLabel = JBLabel("Hermes AI").apply {
@@ -189,8 +190,18 @@ class ChatPanel(private val project: Project) : JPanel(BorderLayout()) {
 
         popup.show(invoker, 0, invoker.height + JBUI.scale(4))
     }
-
     private fun createAndSwitchToNew() {
+        // Prevent switching during streaming response
+        if (isStreaming) {
+            JOptionPane.showMessageDialog(
+                this,
+                "Please wait for the current response to complete before creating a new conversation.",
+                "Response in Progress",
+                JOptionPane.WARNING_MESSAGE
+            )
+            return
+        }
+        
         messageListPanel.clear()
         val chatService = HermesChatService.getInstance(project)
         chatService.createNewConversation()
@@ -198,6 +209,17 @@ class ChatPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun switchToConversation(id: String) {
+        // Prevent switching during streaming response
+        if (isStreaming) {
+            JOptionPane.showMessageDialog(
+                this,
+                "Please wait for the current response to complete before switching conversations.",
+                "Response in Progress",
+                JOptionPane.WARNING_MESSAGE
+            )
+            return
+        }
+        
         messageListPanel.clear()
         val chatService = HermesChatService.getInstance(project)
         chatService.switchConversation(id)
@@ -273,6 +295,7 @@ class ChatPanel(private val project: Project) : JPanel(BorderLayout()) {
         messageListPanel.addUserMessage(messageContent)
         messageListPanel.startAssistantMessage()
         inputPanel.setStreaming(true)
+        isStreaming = true
 
         val chatService = HermesChatService.getInstance(project)
         chatService.sendMessage(text, contexts, files, images, this)
@@ -319,22 +342,41 @@ class ChatPanel(private val project: Project) : JPanel(BorderLayout()) {
     private fun onCancelStreaming() {
         val chatService = HermesChatService.getInstance(project)
         chatService.cancelCurrentRequest()
+        // 标记所有工具调用为中断状态
+        messageListPanel.getStreamingBubble()?.cancelAllToolCalls()
         // 先追加取消提示，再 finalize（顺序不能颠倒：finalizeStreaming 会把 streamingBubble 置 null）
         messageListPanel.appendToken("\n\n*(Response cancelled)*")
         inputPanel.setStreaming(false)
         messageListPanel.finalizeStreaming()
+        isStreaming = false
     }
 
     fun onTokenReceived(token: String) {
         messageListPanel.appendToken(token)
     }
 
+    /**
+     * 显示工具调用状态
+     */
+    fun onToolCall(toolName: String, status: String = "Running...") {
+        messageListPanel.showToolCall(toolName, status)
+    }
+
+    /**
+     * 标记工具调用完成
+     */
+    fun onToolCallComplete(toolName: String) {
+        messageListPanel.completeToolCall(toolName)
+    }
+
     fun onStreamingComplete() {
+        isStreaming = false
         inputPanel.setStreaming(false)
         messageListPanel.finalizeStreaming()
     }
 
     fun onStreamingError(error: String) {
+        isStreaming = false
         inputPanel.setStreaming(false)
 
         val currentBubble = messageListPanel.getStreamingBubble()

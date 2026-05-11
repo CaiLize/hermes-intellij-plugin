@@ -5,6 +5,9 @@ import com.hermes.intellij.api.HermesApiException
 import com.hermes.intellij.api.models.ChatMessage
 import com.hermes.intellij.api.models.ChatRequest
 import com.hermes.intellij.api.models.FileAttachmentData
+import com.hermes.intellij.api.models.FunctionDefinition
+import com.hermes.intellij.api.models.ToolCallRecord
+import com.hermes.intellij.api.models.ToolDefinition
 import com.hermes.intellij.model.CodeContext
 import com.hermes.intellij.model.ConversationSummary
 import com.hermes.intellij.model.FileAttachment
@@ -28,6 +31,9 @@ class HermesChatService(private val project: Project) {
     private val conversationManager = ConversationManager(project)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var currentJob: Job? = null
+    
+    // 工具调用历史记录（按顺序保存）
+    private val pendingToolCalls = mutableListOf<ToolCallRecord>()
 
     init {
         conversationManager.setProjectInfo(project.name)
@@ -80,11 +86,21 @@ class HermesChatService(private val project: Project) {
         )
         logger.info("[HermesChat] Sending request: contexts=${codeContextInfos.size}, files=${fileInfos.size}, images=${imageBase64Urls.size}, mergedTextLen=${mergedUserText.length}")
 
+        // Build tool definitions for function calling
+        val tools = buildToolDefinitions()
+        logger.info("[HermesChat] Tool definitions: ${tools.size} tools declared")
+
+        // Clear pending tool calls
+        pendingToolCalls.clear()
+
         // Build the ChatRequest
         val request = ChatRequest(
             model = settings.modelName,
             messages = messages,
-            stream = true
+            stream = true,
+            temperature = null,
+            maxTokens = null,
+            tools = tools
         )
 
         // Check request body size before sending
@@ -144,9 +160,48 @@ class HermesChatService(private val project: Project) {
                         }
                     }
                     .collect { delta ->
+                        // Log delta for debugging tool call visibility
+                        logger.info("[HermesChat] Received delta: choices=${delta.choices.size}, hasToolCalls=${delta.choices.any { it.delta.toolCalls != null }}, hasContent=${delta.choices.any { it.delta.content != null }}")
+                        
                         for (choice in delta.choices) {
+                            // Handle tool_calls
+                            choice.delta.toolCalls?.forEach { toolCall ->
+                                val toolName = toolCall.function?.name ?: "unknown"
+                                val toolArgs = toolCall.function?.arguments ?: ""
+                                logger.info("[HermesChat] Tool call detected: $toolName, args=${toolArgs.take(100)}")
+                                
+                                
+                                // Add to pending tool calls
+                                pendingToolCalls.add(ToolCallRecord(
+                                    name = toolName,
+                                    status = "Running...",
+                                    arguments = toolArgs,
+                                    completed = false
+                                ))
+                                
+                                logger.info("[HermesChat] Showing tool call UI: $toolName (pending=${pendingToolCalls.size})")
+                                ApplicationManager.getApplication().invokeLater {
+                                    chatPanel.onToolCall(toolName, "Running...")
+                                }
+                            }
+
+                            // Handle content - mark all pending tool calls as complete
                             val content = choice.delta.content
                             if (content != null) {
+                                if (pendingToolCalls.isNotEmpty()) {
+                                    // Mark all pending tool calls as complete before showing content
+                                    val completedTools = pendingToolCalls.map { it.copy(completed = true, status = "completed") }
+                                    pendingToolCalls.clear()
+                                    pendingToolCalls.addAll(completedTools)
+                                    
+                                    logger.info("[HermesChat] Marking ${completedTools.size} tool(s) as complete, starting content display")
+                                    ApplicationManager.getApplication().invokeLater {
+                                        completedTools.forEach { tool ->
+                                            chatPanel.onToolCallComplete(tool.name)
+                                        }
+                                    }
+                                }
+                                
                                 responseBuilder.append(content)
                                 ApplicationManager.getApplication().invokeLater {
                                     chatPanel.onTokenReceived(content)
@@ -154,6 +209,19 @@ class HermesChatService(private val project: Project) {
                             }
                         }
                     }
+
+                // Mark any remaining pending tool calls as complete
+                if (pendingToolCalls.isNotEmpty()) {
+                    val completedTools = pendingToolCalls.map { it.copy(completed = true, status = "completed") }
+                    pendingToolCalls.clear()
+                    pendingToolCalls.addAll(completedTools)
+                    
+                    ApplicationManager.getApplication().invokeLater {
+                        completedTools.forEach { tool ->
+                            chatPanel.onToolCallComplete(tool.name)
+                        }
+                    }
+                }
 
                 val fullResponse = responseBuilder.toString()
                 if (fullResponse.isNotEmpty()) {
@@ -179,7 +247,13 @@ class HermesChatService(private val project: Project) {
                         imageBase64Urls = imageBase64Urls,
                         fileAttachments = allFileAttachments
                     )
-                    conversationManager.addAssistantMessage(fullResponse)
+                    
+                    // Save assistant message with tool call history
+                    val toolCallRecords = if (pendingToolCalls.isNotEmpty()) {
+                        pendingToolCalls.toList()
+                    } else null
+                    conversationManager.addAssistantMessage(fullResponse, toolCallRecords)
+                    
                     // Persist after each exchange
                     conversationManager.saveCurrentConversation()
                 }
@@ -188,6 +262,16 @@ class HermesChatService(private val project: Project) {
                     chatPanel.onStreamingComplete()
                 }
             } catch (e: CancellationException) {
+                // Mark any remaining pending tool calls as complete
+                if (pendingToolCalls.isNotEmpty()) {
+                    val completedTools = pendingToolCalls.map { it.copy(completed = true, status = "completed") }
+                    ApplicationManager.getApplication().invokeLater {
+                        completedTools.forEach { tool ->
+                            chatPanel.onToolCallComplete(tool.name)
+                        }
+                    }
+                }
+                
                 // Save partial conversation on cancel
                 val partial = responseBuilder.toString()
                 if (partial.isNotEmpty()) {
@@ -211,14 +295,35 @@ class HermesChatService(private val project: Project) {
                         imageBase64Urls = imageBase64Urls,
                         fileAttachments = allFileAttachments
                     )
-                    conversationManager.addAssistantMessage(partial + "\n\n(Response cancelled)")
+                    
+                    // Save assistant message with tool call history (mark all as complete on cancel)
+                    val toolCallRecords = if (pendingToolCalls.isNotEmpty()) {
+                        pendingToolCalls.map { it.copy(completed = true, status = "completed") }
+                    } else null
+                    conversationManager.addAssistantMessage(partial + "\n\n(Response cancelled)", toolCallRecords)
+                    
                     conversationManager.saveCurrentConversation()
                 }
                 logger.info("Hermes request cancelled")
             } catch (e: Exception) {
+                // Mark any remaining pending tool calls as complete
+                if (pendingToolCalls.isNotEmpty()) {
+                    val completedTools = pendingToolCalls.map { it.copy(completed = true, status = "completed") }
+                    ApplicationManager.getApplication().invokeLater {
+                        completedTools.forEach { tool ->
+                            chatPanel.onToolCallComplete(tool.name)
+                        }
+                    }
+                }
+                
                 logger.warn("Hermes unexpected error", e)
                 ApplicationManager.getApplication().invokeLater {
                     chatPanel.onStreamingError("Unexpected error: ${e.message}")
+                }
+            } finally {
+                // Ensure tool calls are marked complete and input is enabled
+                ApplicationManager.getApplication().invokeLater {
+                    chatPanel.onStreamingComplete()
                 }
             }
         }
@@ -283,6 +388,134 @@ class HermesChatService(private val project: Project) {
             return conversationManager.createConversation()
         }
         return conversationManager.getCurrentConversationId()!!
+    }
+
+    /**
+     * Build tool definitions for function calling.
+     * Declares available tools to the model so it can request tool use.
+     */
+    private fun buildToolDefinitions(): List<ToolDefinition> {
+        val json = Json { encodeDefaults = true }
+        
+        return listOf(
+            // web_search tool
+            ToolDefinition(
+                type = "function",
+                function = FunctionDefinition(
+                    name = "web_search",
+                    description = "Search the web for current information on any topic",
+                    parameters = json.parseToJsonElement("""
+                        {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "The search query"
+                                }
+                            },
+                            "required": ["query"]
+                        }
+                    """)
+                )
+            ),
+            // read_file tool
+            ToolDefinition(
+                type = "function",
+                function = FunctionDefinition(
+                    name = "read_file",
+                    description = "Read the contents of a file at the specified path",
+                    parameters = json.parseToJsonElement("""
+                        {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "The absolute or relative path to the file"
+                                }
+                            },
+                            "required": ["path"]
+                        }
+                    """)
+                )
+            ),
+            // write_file tool
+            ToolDefinition(
+                type = "function",
+                function = FunctionDefinition(
+                    name = "write_file",
+                    description = "Write content to a file at the specified path, creating it if it doesn't exist",
+                    parameters = json.parseToJsonElement("""
+                        {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "The absolute or relative path to the file"
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "The content to write to the file"
+                                }
+                            },
+                            "required": ["path", "content"]
+                        }
+                    """)
+                )
+            ),
+            // terminal tool
+            ToolDefinition(
+                type = "function",
+                function = FunctionDefinition(
+                    name = "terminal",
+                    description = "Execute a shell command and return the output",
+                    parameters = json.parseToJsonElement("""
+                        {
+                            "type": "object",
+                            "properties": {
+                                "command": {
+                                    "type": "string",
+                                    "description": "The shell command to execute"
+                                },
+                                "timeout": {
+                                    "type": "integer",
+                                    "description": "Maximum time in seconds to wait for the command to complete"
+                                }
+                            },
+                            "required": ["command"]
+                        }
+                    """)
+                )
+            ),
+            // search_files tool
+            ToolDefinition(
+                type = "function",
+                function = FunctionDefinition(
+                    name = "search_files",
+                    description = "Search for files by name pattern or search inside file contents using regex",
+                    parameters = json.parseToJsonElement("""
+                        {
+                            "type": "object",
+                            "properties": {
+                                "pattern": {
+                                    "type": "string",
+                                    "description": "The glob pattern (for files) or regex pattern (for content)"
+                                },
+                                "target": {
+                                    "type": "string",
+                                    "enum": ["files", "content"],
+                                    "description": "Whether to search for files or inside file contents"
+                                },
+                                "path": {
+                                    "type": "string",
+                                    "description": "The directory to search in"
+                                }
+                            },
+                            "required": ["pattern", "target"]
+                        }
+                    """)
+                )
+            )
+        )
     }
 
     companion object {

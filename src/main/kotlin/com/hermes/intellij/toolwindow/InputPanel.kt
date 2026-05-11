@@ -55,7 +55,13 @@ class InputPanel(
     /**
      * TransferHandler 仅处理文件和图片的拖拽。
      * 文本粘贴完全交给 Swing 默认机制，不做任何干预，避免重复插入。
+     * 
+     * 重要：Ctrl+V 粘贴图片时，KeyEventDispatcher 已经先处理了，
+     * 所以 TransferHandler 不应该再处理图片粘贴，否则会重复。
+     * 只处理拖拽（DnD）场景的图片/文件。
      */
+    private var isDragging = false
+    
     private val unifiedTransferHandler = object : TransferHandler() {
         override fun canImport(comp: JComponent, flavors: Array<DataFlavor>): Boolean {
             return flavors.any {
@@ -78,7 +84,8 @@ class InputPanel(
                     return false
                 }
 
-                if (t.isDataFlavorSupported(DataFlavor.imageFlavor)) {
+                // 只在拖拽时处理图片粘贴，键盘粘贴已由 KeyEventDispatcher 处理
+                if (isDragging && t.isDataFlavorSupported(DataFlavor.imageFlavor)) {
                     try {
                         val image = t.getTransferData(DataFlavor.imageFlavor) as? Image
                         if (image != null) {
@@ -300,6 +307,18 @@ class InputPanel(
     // ==================== end Ctrl+V ====================
 
     init {
+        // 监听拖拽开始/结束，用于区分键盘粘贴和拖拽粘贴
+        textArea.addMouseMotionListener(object : java.awt.event.MouseMotionAdapter() {
+            override fun mouseDragged(e: java.awt.event.MouseEvent) {
+                isDragging = true
+            }
+        })
+        textArea.addMouseListener(object : MouseAdapter() {
+            override fun mouseReleased(e: MouseEvent) {
+                isDragging = false
+            }
+        })
+        
         border = BorderFactory.createCompoundBorder(
             BorderFactory.createMatteBorder(1, 0, 0, 0, ChatColors.separator),
             JBUI.Borders.empty(JBUI.scale(6), JBUI.scale(10), JBUI.scale(8), JBUI.scale(10))

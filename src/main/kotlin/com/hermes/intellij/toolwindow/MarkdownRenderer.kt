@@ -35,7 +35,7 @@ object MarkdownRenderer {
 
         val wrapWidth = if (parentWidth > 0) parentWidth else 600
 
-        // 解析为 Block 列表（文本+表格、代码块）
+        // 解析为 Block 列表（文本 + 表格、代码块）
         val blocks = parseBlocks(cleanedText)
 
         for (block in blocks) {
@@ -197,8 +197,8 @@ object MarkdownRenderer {
             alignmentX = Component.LEFT_ALIGNMENT
             alignmentY = Component.TOP_ALIGNMENT
             add(label, BorderLayout.CENTER)
-            // 限制 maximumSize 防止 BoxLayout 分配多余空间
-            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height + JBUI.scale(4))
+            // 紧凑模式：减少边距 (原 4 → 2)
+            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height + JBUI.scale(2))
         }
     }
 
@@ -238,8 +238,8 @@ object MarkdownRenderer {
             gridColor = com.intellij.ui.JBColor(Color(221, 221, 221), Color(80, 80, 80))
             setShowGrid(true)
             intercellSpacing = Dimension(1, 1)
-            rowHeight = JBUI.scale(28)
-            setRowMargin(JBUI.scale(2))
+            rowHeight = JBUI.scale(24)  // 紧凑模式：减少行高 (原 28 → 24)
+            setRowMargin(JBUI.scale(1))  // 紧凑模式：减少行边距 (原 2 → 1)
 
             // 自适应列宽：根据表头和单元格内容计算
             autoResizeMode = JTable.AUTO_RESIZE_OFF
@@ -257,8 +257,8 @@ object MarkdownRenderer {
                         if (cellWidth > maxContentWidth) maxContentWidth = cellWidth
                     }
                     columnModel.getColumn(col).apply {
-                        preferredWidth = (maxContentWidth + JBUI.scale(20)).coerceIn(JBUI.scale(60), JBUI.scale(400))
-                        minWidth = JBUI.scale(50)
+                        preferredWidth = (maxContentWidth + JBUI.scale(15)).coerceIn(JBUI.scale(50), JBUI.scale(350))  // 紧凑模式
+                        minWidth = JBUI.scale(45)
                     }
                 }
             }
@@ -269,14 +269,12 @@ object MarkdownRenderer {
                     hasFocus: Boolean, row: Int, column: Int
                 ): java.awt.Component {
                     val text = value?.toString() ?: ""
-                    // 使用 JLabel 渲染，将行内代码标记去掉 HTML 标签，
-                    // 用简单文本显示（比 JEditorPane 更可靠，不会截断）
                     val displayText = text
                         .replace(Regex("`([^`]+)`")) { "'${it.groupValues[1]}'" }
                         .replace(Regex("\\*\\*([^*]+)\\*\\*")) { it.groupValues[1] }
                     val c = super.getTableCellRendererComponent(table, displayText, isSelected, hasFocus, row, column)
-                    border = JBUI.Borders.empty(2, 6)
-                    toolTipText = text  // 悬停显示原始文本（含格式标记）
+                    border = JBUI.Borders.empty(1, 4)  // 紧凑模式：减少单元格边距 (原 2,6 → 1,4)
+                    toolTipText = text
                     return c
                 }
             }
@@ -293,7 +291,6 @@ object MarkdownRenderer {
         val dataHeight = table.rowHeight * table.rowCount
         val totalHeight = headerHeight + dataHeight
 
-        // 计算表格实际宽度
         val tableWidth = (0 until table.columnCount).sumOf { table.columnModel.getColumn(it).preferredWidth }
 
         val scrollPane = JScrollPane(table).apply {
@@ -309,9 +306,9 @@ object MarkdownRenderer {
             isOpaque = false
             alignmentX = Component.LEFT_ALIGNMENT
             alignmentY = Component.TOP_ALIGNMENT
-            border = JBUI.Borders.empty(4, 0)
+            border = JBUI.Borders.empty(2, 0)  // 紧凑模式：减少表格边距 (原 4,0 → 2,0)
             add(scrollPane, BorderLayout.CENTER)
-            maximumSize = Dimension(Int.MAX_VALUE, totalHeight + JBUI.scale(10))
+            maximumSize = Dimension(Int.MAX_VALUE, totalHeight + JBUI.scale(6))  // 紧凑模式
         }
     }
 
@@ -348,11 +345,6 @@ object MarkdownRenderer {
 
     /**
      * 用单个 JEditorPane 渲染文本块，支持文本选择和复制。
-     *
-     * 【核心设计】不预先计算高度，让 JEditorPane 自然布局。
-     * 在 addNotify() 中设置初始宽度约束，确保 HTML 渲染器有正确的换行宽度。
-     * 不覆盖 preferredSize / maximumSize，让 JEditorPane 自己管理。
-     * NoStretchVerticalLayout 会尊重子组件的 getPreferredSize()，不会强行压缩。
      */
     private fun createTextComponent(text: String, parentWidth: Int = 0): JComponent? {
         val html = convertTextToHtml(text)
@@ -364,7 +356,7 @@ object MarkdownRenderer {
             append("<html><body style='")
             append("font-family:Dialog,'Microsoft YaHei','PingFang SC',sans-serif;")
             append("font-size:13px;")
-            append("margin:2px 2px;")
+            append("margin:1px 1px;")  // 紧凑模式：减少 body margin (原 2px → 1px)
             append("padding:0;")
             append("word-wrap:break-word;")
             append("'>")
@@ -376,11 +368,6 @@ object MarkdownRenderer {
             val editorPane = object : JEditorPane() {
                 private var initialWidthSet = false
 
-                /**
-                 * 组件被添加到容器时调用。此时设置宽度约束，让 HTML 渲染器
-                 * 在后续布局中使用正确的换行宽度。
-                 * 注意：不能在 addNotify 中调用 setText，会触发 Swing 内部 NPE！
-                 */
                 override fun addNotify() {
                     super.addNotify()
                     if (!initialWidthSet) {
@@ -392,15 +379,11 @@ object MarkdownRenderer {
                     }
                 }
 
-                /**
-                 * 覆盖 getPreferredSize，确保在视图构建后返回正确高度。
-                 * 如果高度为0（视图尚未构建），返回一个基于内容行数的估算高度。
-                 */
                 override fun getPreferredSize(): Dimension {
                     val pref = super.getPreferredSize()
                     if (pref.height <= JBUI.scale(20)) {
                         val lineCount = text.count { it == '\n' } + 1
-                        val estimatedHeight = (lineCount * JBUI.scale(20)).coerceAtMost(8000)
+                        val estimatedHeight = (lineCount * JBUI.scale(18)).coerceAtMost(8000)  // 紧凑模式
                         return Dimension(pref.width, estimatedHeight)
                     }
                     return pref
@@ -420,7 +403,6 @@ object MarkdownRenderer {
                 }
             }
 
-            // 窗口缩放时重新布局
             editorPane.addComponentListener(object : ComponentAdapter() {
                 private var lastWidth = -1
                 override fun componentResized(e: ComponentEvent?) {
@@ -457,11 +439,7 @@ object MarkdownRenderer {
 
     /**
      * 将普通文本转换为 HTML。
-     * 注意：表格已在 parseBlocks 阶段被抽离为 Block.Table，不会出现在这里。
-     *
-     * 使用 <p> 标签 + margin 属性（Swing HTML 渲染器对 <p> + margin 支持最稳定），
-     * 不使用 <div> + padding/height（Swing 对这些 CSS 属性支持不稳定）。
-     * 不依赖 line-height（Swing 中表现不一致），改用显式 margin 控制间距。
+     * 紧凑模式：减少段落间距
      */
     private fun convertTextToHtml(text: String): String {
         val sb = StringBuilder()
@@ -472,8 +450,8 @@ object MarkdownRenderer {
             val trimmed = lines[i].trim()
 
             if (trimmed.isEmpty()) {
-                // 空行 → 段落间距（用 &nbsp; 防止空 <p> 被折叠）
-                sb.append("<p style='margin-top:4px;margin-bottom:4px;'>&nbsp;</p>")
+                // 紧凑模式：减少空行间距 (原 4px → 2px)
+                sb.append("<p style='margin-top:2px;margin-bottom:2px;'>&nbsp;</p>")
                 i++
                 continue
             }
@@ -483,35 +461,38 @@ object MarkdownRenderer {
                     sb.append("<hr noshade size=1 color=#cccccc>")
                 }
                 trimmed.startsWith("### ") -> {
-                    sb.append("<p style='margin-top:10px;margin-bottom:4px;'><b style='font-size:14px;'>")
+                    // 紧凑模式：减少标题间距
+                    sb.append("<p style='margin-top:6px;margin-bottom:2px;'><b style='font-size:14px;'>")
                         .append(processInline(trimmed.removePrefix("### ")))
                         .append("</b></p>")
                 }
                 trimmed.startsWith("## ") -> {
-                    sb.append("<p style='margin-top:12px;margin-bottom:4px;'><b style='font-size:15px;'>")
+                    sb.append("<p style='margin-top:8px;margin-bottom:2px;'><b style='font-size:15px;'>")
                         .append(processInline(trimmed.removePrefix("## ")))
                         .append("</b></p>")
                 }
                 trimmed.startsWith("# ") -> {
-                    sb.append("<p style='margin-top:14px;margin-bottom:6px;'><b style='font-size:16px;'>")
+                    sb.append("<p style='margin-top:10px;margin-bottom:3px;'><b style='font-size:16px;'>")
                         .append(processInline(trimmed.removePrefix("# ")))
                         .append("</b></p>")
                 }
                 trimmed.startsWith("- ") || trimmed.startsWith("* ") -> {
-                    sb.append("<p style='margin-left:16px;margin-top:3px;margin-bottom:3px;'>&bull;&nbsp;")
+                    // 紧凑模式：减少列表项间距 (原 3px → 1px)
+                    sb.append("<p style='margin-left:16px;margin-top:1px;margin-bottom:1px;'>&bull;&nbsp;")
                         .append(processInline(trimmed.substring(2)))
                         .append("</p>")
                 }
                 trimmed.matches(Regex("^\\d+\\.\\s.*")) -> {
                     val content = trimmed.replaceFirst(Regex("^\\d+\\.\\s"), "")
                     val num = trimmed.substringBefore(".")
-                    sb.append("<p style='margin-left:16px;margin-top:3px;margin-bottom:3px;'>")
+                    sb.append("<p style='margin-left:16px;margin-top:1px;margin-bottom:1px;'>")
                         .append(num).append(".&nbsp;")
                         .append(processInline(content))
                         .append("</p>")
                 }
                 else -> {
-                    sb.append("<p style='margin-top:3px;margin-bottom:3px;'>").append(processInline(trimmed)).append("</p>")
+                    // 紧凑模式：减少普通段落间距 (原 3px → 1px)
+                    sb.append("<p style='margin-top:1px;margin-bottom:1px;'>").append(processInline(trimmed)).append("</p>")
                 }
             }
             i++
@@ -546,7 +527,6 @@ object MarkdownRenderer {
             .replace(">", "&gt;")
 
         result = result.replace(Regex("\\*\\*(.+?)\\*\\*"), "<b>$1</b>")
-        // 简化代码样式，只保留 Swing 支持的 CSS 属性（border-radius 等会导致 NPE）
         result = result.replace(Regex("`(.+?)`"), "<code style='background:#f0f0f0;font-family:monospace;font-size:12px;'>$1</code>")
 
         return result

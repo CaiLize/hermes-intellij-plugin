@@ -171,10 +171,10 @@ class HermesApiClient {
 
             val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
             // 仅记录状态码，不记录响应体（可能包含敏感信息）
-            logger.info("Hermes delete session response: ${response.statusCode()}")
+            logger.info("[ApiClient] DELETE /sessions/$sessionId -> ${response.statusCode()}")
             response.statusCode() in 200..299
         } catch (e: Exception) {
-            logger.warn("Hermes delete session failed for $sessionId", e)
+            logger.warn("[ApiClient] DELETE /sessions/$sessionId failed: ${e.message}", e)
             false
         }
     }

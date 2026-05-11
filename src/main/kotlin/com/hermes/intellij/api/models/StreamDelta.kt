@@ -20,5 +20,22 @@ data class StreamChoice(
 @Serializable
 data class Delta(
     val role: String? = null,
-    val content: String? = null
+    val content: String? = null,
+    @SerialName("tool_calls")
+    val toolCalls: List<ToolCall>? = null
+)
+
+@Serializable
+data class ToolCall(
+    val id: String = "",
+    val type: String = "function",
+    val function: FunctionCall? = null,
+    // For incremental tool call parsing
+    val index: Int? = null
+)
+
+@Serializable
+data class FunctionCall(
+    val name: String = "",
+    val arguments: String = ""
 )

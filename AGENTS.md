@@ -409,4 +409,24 @@ release/hermes-ai-assistant-1.0.0.zip
 
 ---
 
-*文档生成时间：2026-05-02 | 版本：1.0.0*
+---
+
+## 14. 详细文档
+
+完整的设计文档位于 `docs/` 目录：
+
+| 目录 | 说明 |
+|------|------|
+| [docs/architecture/](docs/architecture/) | 架构设计（概览、分层、数据流） |
+| [docs/modules/](docs/modules/) | 模块设计（Actions、API、Services、ToolWindow） |
+| [docs/models/](docs/models/) | 数据模型（ChatMessage、ContentPart、MessageSegment） |
+| [docs/api/](docs/api/) | API 接口规范（请求、响应、SSE 协议） |
+| [docs/persistence/](docs/persistence/) | 持久化设计（对话存储、图片存储、迁移策略） |
+| [docs/ui/](docs/ui/) | UI 设计（颜色、消息气泡、Markdown 渲染） |
+| [docs/decisions/](docs/decisions/) | 架构决策记录（ADR） |
+
+详见 [docs/README.md](docs/README.md) 获取完整文档索引。
+
+---
+
+*文档生成时间：2026-05-12 | 版本：1.0.0*

@@ -1,0 +1,26 @@
+package com.hermes.intellij.services
+
+import com.hermes.intellij.api.HermesApiClient
+import com.hermes.intellij.api.HermesApiException
+import com.hermes.intellij.api.models.ChatMessage
+import com.hermes.intellij.api.models.ChatRequest
+import com.hermes.intellij.api.models.FileAttachmentData
+import com.hermes.intellij.api.models.FunctionDefinition
+import com.hermes.intellij.api.models.MessageSegment
+import com.hermes.intellij.api.models.ToolCallRecord
+import com.hermes.intellij.api.models.ToolDefinition
+import com.hermes.intellij.model.CodeContext
+import com.hermes.intellij.model.ConversationSummary
+import com.hermes.intellij.model.FileAttachment
+import com.hermes.intellij.model.ImageContext
+import com.hermes.intellij.toolwindow.ChatPanel
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.components.Service
+import com.intellij.openapi.diagnostic.Logger
+import com.intellij.openapi.fileEditor.FileEditorManager
+import com.intellij.openapi.project.Project
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.catch
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import java.net.ConnectException

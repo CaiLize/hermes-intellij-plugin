@@ -4,9 +4,12 @@ import com.hermes.intellij.api.HermesApiClient
 import com.hermes.intellij.api.models.ChatMessage
 import com.hermes.intellij.api.models.ContentPart
 import com.hermes.intellij.api.models.FileAttachmentData
+import com.hermes.intellij.api.models.MessageSegment
+import com.hermes.intellij.api.models.ToolCallRecord
 import com.hermes.intellij.model.Conversation
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.Disposer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import java.util.UUID
@@ -14,6 +17,11 @@ import java.util.UUID
 /**
  * Manages multiple conversations with persistence support.
  * Delegates storage to ConversationStore and image management to ImageStore.
+ * 
+ * Optimizations:
+ * - Proper resource cleanup on project close
+ * - Lazy conversation loading
+ * - Improved error handling
  */
 class ConversationManager(private val project: Project) {
 
@@ -28,10 +36,20 @@ class ConversationManager(private val project: Project) {
     private var projectName: String = ""
     private var currentFilePath: String? = null
     private var currentFileType: String? = null
+    
+    // Track if conversation is loaded (lazy loading support)
+    private var isConversationLoaded = false
 
     init {
-        // Don't load conversation here — it's too expensive for EDT.
-        // Call loadLastConversation() from a background thread instead.
+        // Register cleanup on project dispose using Disposer
+        // This is the recommended approach for IntelliJ Platform 2024.1+
+        Disposer.register(project) {
+            LOG.info("[ConvMgr] Project disposing, cleaning up resources...")
+            saveCurrentConversation()
+            ImageStore.clearCache()
+            store.clearCache()
+        }
+        LOG.info("[ConvMgr] Initialized for project: ${project.name}")
     }
 
     /**
@@ -41,6 +59,9 @@ class ConversationManager(private val project: Project) {
         val activeId = store.getActiveConversationId()
         if (activeId != null) {
             loadConversation(activeId)
+        } else {
+            // No active conversation, create a new one
+            createConversation()
         }
     }
 
@@ -60,6 +81,11 @@ class ConversationManager(private val project: Project) {
     fun getCurrentConversationId(): String? = currentConversationId
 
     /**
+     * Check if a conversation is currently loaded.
+     */
+    fun isConversationLoaded(): Boolean = isConversationLoaded
+
+    /**
      * Create a new empty conversation and switch to it.
      * Returns the new conversation ID.
      */
@@ -71,6 +97,7 @@ class ConversationManager(private val project: Project) {
         store.createConversation(id)
         currentConversationId = id
         messages.clear()
+        isConversationLoaded = true
         LOG.info("[ConvMgr] Created new conversation: $id")
         return id
     }
@@ -92,30 +119,34 @@ class ConversationManager(private val project: Project) {
      * Also calls Hermes API to delete the session on the server.
      */
     fun deleteConversation(id: String) {
-        // Get Hermes session ID before deleting
+        // Get Hermes session ID BEFORE deleting from local storage
         val hermesSessionId = store.getHermesSessionId(id)
+        LOG.info("[ConvMgr] Deleting conversation $id, Hermes session ID: ${hermesSessionId ?: "null"}")
         
-        // Delete from local storage first
+        // Delete from local storage
         store.deleteConversation(id)
         
-        // Delete from Hermes server (if session ID exists)
-        if (hermesSessionId != null) {
+        // Delete from Hermes server if session ID was available
+        if (!hermesSessionId.isNullOrBlank()) {
             try {
                 val apiClient = HermesApiClient.getInstance()
+                LOG.info("[ConvMgr] Calling Hermes API to delete session: $hermesSessionId")
                 val deleted = apiClient.deleteSession(hermesSessionId)
                 if (deleted) {
-                    LOG.info("[ConvMgr] Deleted Hermes session: $hermesSessionId")
+                    LOG.info("[ConvMgr] Successfully deleted Hermes session: $hermesSessionId")
                 } else {
-                    LOG.warn("[ConvMgr] Failed to delete Hermes session: $hermesSessionId")
+                    LOG.warn("[ConvMgr] Failed to delete Hermes session (API returned false): $hermesSessionId")
                 }
             } catch (e: Exception) {
-                LOG.warn("Failed to delete Hermes session $hermesSessionId", e)
+                LOG.warn("[ConvMgr] Exception deleting Hermes session $hermesSessionId: ${e.message}", e)
             }
+        } else {
+            LOG.warn("[ConvMgr] No Hermes session ID found for conversation $id, skipping server deletion. Was any message sent in this conversation?")
         }
-        
         if (id == currentConversationId) {
             messages.clear()
             currentConversationId = null
+            isConversationLoaded = false
             // Switch to the first available conversation, or create new
             val summaries = store.getConversationSummaries()
             if (summaries.isNotEmpty()) {
@@ -154,6 +185,7 @@ class ConversationManager(private val project: Project) {
     // ============================================================
 
     fun addUserMessage(content: String) {
+        ensureConversationLoaded()
         messages.add(ChatMessage.user(content))
         // Auto-generate title from first user message
         if (messages.count { it.role == "user" } == 1 && currentConversationId != null) {
@@ -170,7 +202,31 @@ class ConversationManager(private val project: Project) {
         imageBase64Urls: List<String> = emptyList(),
         fileAttachments: List<FileAttachmentData> = emptyList()
     ) {
+        ensureConversationLoaded()
         val msg = ChatMessage.userWithAttachments(text, imageBase64Urls, fileAttachments)
+        messages.add(msg)
+        // Auto-generate title from first user message
+        if (messages.count { it.role == "user" } == 1 && currentConversationId != null) {
+            val title = Conversation.generateTitle(text)
+            store.updateTitle(currentConversationId!!, title)
+        }
+    }
+    
+    /**
+     * Add a user message with ordered segments for perfect interleaving of text, images, and files.
+     * This is the preferred method for saving user messages with attachments.
+     * Note: segments should contain all content parts (text, images, files) in order.
+     */
+    fun addUserMessageWithSegments(
+        text: String,
+        segments: List<MessageSegment>?
+    ) {
+        ensureConversationLoaded()
+        val msg = ChatMessage(
+            role = "user",
+            content = text,
+            segments = segments
+        )
         messages.add(msg)
         // Auto-generate title from first user message
         if (messages.count { it.role == "user" } == 1 && currentConversationId != null) {
@@ -180,7 +236,40 @@ class ConversationManager(private val project: Project) {
     }
 
     fun addAssistantMessage(content: String) {
+        ensureConversationLoaded()
         messages.add(ChatMessage.assistant(content))
+    }
+
+    /**
+     * Add an assistant message with tool call history for persistence.
+     */
+    fun addAssistantMessage(content: String, toolCalls: List<ToolCallRecord>?) {
+        ensureConversationLoaded()
+        val msg = if (toolCalls != null && toolCalls.isNotEmpty()) {
+            ChatMessage.assistant(content, toolCalls)
+        } else {
+            ChatMessage.assistant(content)
+        }
+        messages.add(msg)
+    }
+
+    /**
+     * Add an assistant message with ordered segments for perfect interleaving.
+     * This is the preferred method for saving streaming responses with tool calls.
+     */
+    fun addAssistantMessageWithSegments(
+        content: String,
+        segments: List<MessageSegment>?,
+        toolCalls: List<ToolCallRecord>? = null
+    ) {
+        ensureConversationLoaded()
+        val msg = ChatMessage(
+            role = "assistant",
+            content = content,
+            segments = segments,
+            toolCalls = toolCalls
+        )
+        messages.add(msg)
     }
 
     /**
@@ -189,6 +278,7 @@ class ConversationManager(private val project: Project) {
     fun setHermesSessionId(sessionId: String) {
         if (currentConversationId != null) {
             store.setHermesSessionId(currentConversationId!!, sessionId)
+            LOG.info("[ConvMgr] Saved Hermes session ID $sessionId for conversation $currentConversationId")
         }
     }
 
@@ -203,10 +293,25 @@ class ConversationManager(private val project: Project) {
         }
     }
 
-    fun getMessages(): List<ChatMessage> = messages.toList()
+    fun getMessages(): List<ChatMessage> {
+        ensureConversationLoaded()
+        return messages.toList()
+    }
 
     fun clear() {
         createConversation()
+    }
+    
+    /**
+     * Ensure conversation is loaded before accessing messages.
+     * This supports lazy loading pattern.
+     */
+    private fun ensureConversationLoaded() {
+        if (!isConversationLoaded && currentConversationId != null) {
+            loadConversation(currentConversationId!!)
+        } else if (currentConversationId == null) {
+            createConversation()
+        }
     }
 
     // ============================================================
@@ -251,6 +356,8 @@ class ConversationManager(private val project: Project) {
         codeContexts: List<CodeContextInfo> = emptyList(),
         imageBase64Urls: List<String> = emptyList()
     ): Pair<List<ChatMessage>, String> {
+        ensureConversationLoaded()
+        
         val requestMessages = mutableListOf<ChatMessage>()
 
         // System message
@@ -320,6 +427,7 @@ class ConversationManager(private val project: Project) {
         }
 
         currentConversationId = id
+        isConversationLoaded = true
         LOG.info("[ConvMgr] Loaded conversation $id (${messages.size} messages)")
         return true
     }
@@ -327,7 +435,7 @@ class ConversationManager(private val project: Project) {
     /**
      * Resolve hermes-image:xxx references in a ChatMessage's contentParts back to
      * actual base64 data URLs by loading from disk.
-     * If an image cannot be loaded, the reference is left unchanged (will fail at API time).
+     * If an image cannot be loaded, preserves the reference for lazy loading.
      */
     private fun resolveHermesImageReferences(msg: ChatMessage, conversationId: String): ChatMessage {
         if (msg.contentParts == null) return msg
@@ -343,9 +451,13 @@ class ConversationManager(private val project: Project) {
                             LOG.info("[ConvMgr] Resolved image reference: $fileName")
                             ContentPart.ImageUrl(part.imageUrl.copy(url = actualUrl))
                         } else {
+                            // Keep reference for lazy loading - UI can handle expired marker
                             LOG.warn("[ConvMgr] Failed to load image: $fileName, keeping reference")
                             part
                         }
+                    } else if (url.startsWith("hermes-image-expired:")) {
+                        // Already marked as expired - keep as-is for UI to handle
+                        part
                     } else {
                         part // Not a hermes-image reference, keep as-is
                     }
