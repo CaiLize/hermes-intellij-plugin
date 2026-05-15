@@ -339,7 +339,7 @@ class ChatPanel(private val project: Project) : JPanel(BorderLayout()) {
         )
     }
 
-    private fun onCancelStreaming() {
+    fun onCancelStreaming() {
         val chatService = HermesChatService.getInstance(project)
         chatService.cancelCurrentRequest()
         // 标记所有工具调用为中断状态
@@ -369,7 +369,15 @@ class ChatPanel(private val project: Project) : JPanel(BorderLayout()) {
         messageListPanel.completeToolCall(toolName)
     }
 
+    /**
+     * FIX: 添加幂等性检查，防止重复调用导致 UI 状态异常
+     * 流式完成后，isStreaming 已经是 false，重复调用会直接返回
+     */
     fun onStreamingComplete() {
+        if (!isStreaming) {
+            // 已经结束了，忽略重复调用
+            return
+        }
         isStreaming = false
         inputPanel.setStreaming(false)
         messageListPanel.finalizeStreaming()

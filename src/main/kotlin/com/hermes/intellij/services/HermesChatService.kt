@@ -6,6 +6,7 @@ import com.hermes.intellij.api.models.ChatMessage
 import com.hermes.intellij.api.models.ChatRequest
 import com.hermes.intellij.api.models.FileAttachmentData
 import com.hermes.intellij.api.models.FunctionDefinition
+import com.hermes.intellij.api.models.MessageSegment
 import com.hermes.intellij.api.models.ToolCallRecord
 import com.hermes.intellij.api.models.ToolDefinition
 import com.hermes.intellij.model.CodeContext
@@ -118,6 +119,7 @@ class HermesChatService(private val project: Project) {
         }
 
         val responseBuilder = StringBuilder()
+        var hasCompleted = false  // FIX: Track if streaming completed normally
 
         currentJob = scope.launch {
             try {
@@ -151,10 +153,22 @@ class HermesChatService(private val project: Project) {
                                     else -> "API error (${e.statusCode}). Check logs for details."
                                 }
                             }
-                            else -> "Error: ${e.message}"
+                            is CancellationException -> {
+                                // FIX: Don't show error for cancellation - it's expected
+                                logger.info("[HermesChat] Stream cancelled: ${e.message}")
+                                throw e  // Re-throw to trigger cancellation handler
+                            }
+                            else -> {
+                                logger.warn("[HermesChat] Stream error: ${e.javaClass.simpleName}: ${e.message}")
+                                "Error: ${e.message}"
+                            }
                         }
+                        
                         // 不记录完整的异常堆栈和响应体，避免泄露敏感信息
-                        logger.warn("Hermes streaming error: ${e.javaClass.simpleName} (status=${if (e is HermesApiException) e.statusCode else "N/A"})")
+                        if (e !is CancellationException) {
+                            logger.warn("Hermes streaming error: ${e.javaClass.simpleName} (status=${if (e is HermesApiException) e.statusCode else "N/A"})")
+                        }
+                        
                         ApplicationManager.getApplication().invokeLater {
                             chatPanel.onStreamingError(errorMsg)
                         }
@@ -242,26 +256,38 @@ class HermesChatService(private val project: Project) {
                     }
                     // 注意：保存时只用原始 prompt 作为显示文本，不包含代码上下文内容
                     // 代码上下文和文件内容仅用于 API 请求，文件信息通过 fileAttachments 持久化
-                    conversationManager.addUserMessageWithAttachments(
+                    
+                    // FIX: Use segments for user message to preserve order of text, images, files
+                    val userSegments = buildUserMessageSegments(prompt, imageBase64Urls, allFileAttachments)
+                    conversationManager.addUserMessageWithSegments(
                         text = prompt,
-                        imageBase64Urls = imageBase64Urls,
-                        fileAttachments = allFileAttachments
+                        segments = userSegments
                     )
                     
-                    // Save assistant message with tool call history
+                    // Save assistant message with ordered segments (FIX: preserves tool call order)
+                    // Get segments from the streaming bubble to preserve chronological order
+                    val assistantSegments = chatPanel.messageListPanel.getStreamingSegments()
                     val toolCallRecords = if (pendingToolCalls.isNotEmpty()) {
                         pendingToolCalls.toList()
                     } else null
-                    conversationManager.addAssistantMessage(fullResponse, toolCallRecords)
+                    conversationManager.addAssistantMessageWithSegments(
+                        content = fullResponse,
+                        segments = assistantSegments,
+                        toolCalls = toolCallRecords  // Keep for backward compatibility
+                    )
                     
                     // Persist after each exchange
                     conversationManager.saveCurrentConversation()
                 }
 
+                hasCompleted = true  // FIX: Mark as completed normally
                 ApplicationManager.getApplication().invokeLater {
                     chatPanel.onStreamingComplete()
                 }
             } catch (e: CancellationException) {
+                // FIX: Handle cancellation separately - don't show error to user
+                logger.info("[HermesChat] Request cancelled: ${e.message}")
+                
                 // Mark any remaining pending tool calls as complete
                 if (pendingToolCalls.isNotEmpty()) {
                     val completedTools = pendingToolCalls.map { it.copy(completed = true, status = "completed") }
@@ -290,21 +316,33 @@ class HermesChatService(private val project: Project) {
                         )
                     }
                     // 同上：只保存原始 prompt，不包含代码上下文内容
-                    conversationManager.addUserMessageWithAttachments(
+                    
+                    // FIX: Use segments for user message even on cancel
+                    val userSegments = buildUserMessageSegments(prompt, imageBase64Urls, allFileAttachments)
+                    conversationManager.addUserMessageWithSegments(
                         text = prompt,
-                        imageBase64Urls = imageBase64Urls,
-                        fileAttachments = allFileAttachments
+                        segments = userSegments
                     )
                     
                     // Save assistant message with tool call history (mark all as complete on cancel)
+                    // Get segments from the streaming bubble
+                    val assistantSegments = chatPanel.messageListPanel.getStreamingSegments()
                     val toolCallRecords = if (pendingToolCalls.isNotEmpty()) {
                         pendingToolCalls.map { it.copy(completed = true, status = "completed") }
                     } else null
-                    conversationManager.addAssistantMessage(partial + "\n\n(Response cancelled)", toolCallRecords)
+                    conversationManager.addAssistantMessageWithSegments(
+                        content = partial + "\n\n*(Response cancelled)*",
+                        segments = assistantSegments,
+                        toolCalls = toolCallRecords
+                    )
                     
                     conversationManager.saveCurrentConversation()
                 }
-                logger.info("Hermes request cancelled")
+                
+                // FIX: Explicitly call onCancelStreaming to clean up UI state
+                ApplicationManager.getApplication().invokeLater {
+                    chatPanel.onCancelStreaming()
+                }
             } catch (e: Exception) {
                 // Mark any remaining pending tool calls as complete
                 if (pendingToolCalls.isNotEmpty()) {
@@ -316,17 +354,70 @@ class HermesChatService(private val project: Project) {
                     }
                 }
                 
-                logger.warn("Hermes unexpected error", e)
+                logger.warn("[HermesChat] Unexpected error", e)
                 ApplicationManager.getApplication().invokeLater {
                     chatPanel.onStreamingError("Unexpected error: ${e.message}")
                 }
             } finally {
-                // Ensure tool calls are marked complete and input is enabled
-                ApplicationManager.getApplication().invokeLater {
-                    chatPanel.onStreamingComplete()
+                // FIX: Always clean up, regardless of how the coroutine ended
+                // This prevents the "input box stuck in disabled state" bug
+                currentJob = null
+                pendingToolCalls.clear()
+                
+                // Only call onStreamingComplete if we didn't already handle completion/cancellation
+                if (!hasCompleted) {
+                    logger.info("[HermesChat] Finally block cleaning up (hasCompleted=$hasCompleted)")
+                    ApplicationManager.getApplication().invokeLater {
+                        // Only finalize if not already finalized by onStreamingComplete or onCancelStreaming
+                        if (chatPanel.messageListPanel.getStreamingBubble() != null) {
+                            chatPanel.onStreamingComplete()
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /**
+     * Build ordered segments for a user message, preserving the chronological order
+     * of text, images, and files.
+     */
+    private fun buildUserMessageSegments(
+        text: String,
+        imageBase64Urls: List<String>,
+        fileAttachments: List<FileAttachmentData>
+    ): List<MessageSegment> {
+        val segments = mutableListOf<MessageSegment>()
+        
+        // Start with text
+        if (text.isNotBlank()) {
+            segments.add(MessageSegment.Text(text))
+        }
+        
+        // Add images in order
+        for (base64Url in imageBase64Urls) {
+            // Extract base64 data from data URL
+            val base64Data = if (base64Url.startsWith("data:")) {
+                base64Url.substringAfter(",")
+            } else {
+                base64Url
+            }
+            if (base64Data.isNotBlank()) {
+                segments.add(MessageSegment.Image(base64Data = base64Data))
+            }
+        }
+        
+        // Add files in order
+        for (file in fileAttachments) {
+            segments.add(MessageSegment.File(
+                filePath = file.filePath,
+                fileName = file.filePath.substringAfterLast('/'),
+                lineRange = file.lineRange,
+                language = file.language
+            ))
+        }
+        
+        return segments
     }
 
     fun cancelCurrentRequest() {

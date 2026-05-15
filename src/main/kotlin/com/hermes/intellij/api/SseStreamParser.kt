@@ -22,6 +22,9 @@ object SseStreamParser {
      * Handles: data lines, [DONE] signal, comment lines, blank lines.
      * Also parses tool_call events from SSE comment lines (format: ": tool_call {...}")
      * and Hermes-specific hermes.tool.progress events (format: "event: hermes.tool.progress").
+     * 
+     * FIX (BUG-004): Added explicit state cleanup in finally block for better code clarity
+     * and to handle edge cases where the flow might be cancelled unexpectedly.
      */
     fun parse(lines: Flow<String>): Flow<StreamDelta> = flow {
         val dataBuffer = StringBuilder()
@@ -29,133 +32,141 @@ object SseStreamParser {
         // Track pending tool calls from hermes.tool.progress events (per-stream state)
         val pendingHermesToolCalls = mutableMapOf<String, String>() // toolCallId -> toolName
 
-        lines.collect { line ->
-            when {
-                line.startsWith("data: [DONE]") || line.startsWith("data:[DONE]") -> {
-                    return@collect
-                }
-
-                // Track SSE event type for Hermes-specific events
-                line.startsWith("event: ") -> {
-                    currentEventType = line.removePrefix("event: ").trim()
-                }
-
-                // Parse tool_call events from SSE comment lines (legacy format)
-                line.startsWith(": tool_call ") -> {
-                    try {
-                        val toolCallJson = line.removePrefix(": tool_call ").trim()
-                        val toolCallData = json.decodeFromString<ToolCallData>(toolCallJson)
-                        // Emit a StreamDelta with tool_calls
-                        val toolCall = ToolCall(
-                            id = toolCallData.id ?: "",
-                            type = "function",
-                            function = FunctionCall(
-                                name = toolCallData.name,
-                                arguments = toolCallData.arguments ?: ""
-                            ),
-                            index = toolCallData.index
-                        )
-                        emit(StreamDelta(
-                            id = "",
-                            choices = listOf(com.hermes.intellij.api.models.StreamChoice(
-                                index = toolCallData.index ?: 0,
-                                delta = Delta(toolCalls = listOf(toolCall))
-                            ))
-                        ))
-                    } catch (e: Exception) {
-                        // Skip malformed tool_call events
+        try {
+            lines.collect { line ->
+                when {
+                    line.startsWith("data: [DONE]") || line.startsWith("data:[DONE]") -> {
+                        return@collect
                     }
-                }
 
-                // Parse Hermes-specific hermes.tool.progress events
-                currentEventType == "hermes.tool.progress" && line.startsWith("data: ") -> {
-                    try {
-                        val payload = line.removePrefix("data: ").trim()
-                        val progressData = json.decodeFromString<HermesToolProgressData>(payload)
-                        
-                        // Only emit tool call delta on "running" status
-                        if (progressData.status == "running" && progressData.tool.isNotEmpty()) {
-                            // Track the tool call for later completion
-                            if (progressData.toolCallId.isNotEmpty()) {
-                                pendingHermesToolCalls[progressData.toolCallId] = progressData.tool
-                            }
-                            
-                            // Emit a StreamDelta with tool_calls to trigger UI
+                    // Track SSE event type for Hermes-specific events
+                    line.startsWith("event: ") -> {
+                        currentEventType = line.removePrefix("event: ").trim()
+                    }
+
+                    // Parse tool_call events from SSE comment lines (legacy format)
+                    line.startsWith(": tool_call ") -> {
+                        try {
+                            val toolCallJson = line.removePrefix(": tool_call ").trim()
+                            val toolCallData = json.decodeFromString<ToolCallData>(toolCallJson)
+                            // Emit a StreamDelta with tool_calls
                             val toolCall = ToolCall(
-                                id = progressData.toolCallId,
+                                id = toolCallData.id ?: "",
                                 type = "function",
                                 function = FunctionCall(
-                                    name = progressData.tool,
-                                    arguments = ""
+                                    name = toolCallData.name,
+                                    arguments = toolCallData.arguments ?: ""
                                 ),
-                                index = null
+                                index = toolCallData.index
                             )
                             emit(StreamDelta(
                                 id = "",
                                 choices = listOf(com.hermes.intellij.api.models.StreamChoice(
-                                    index = 0,
+                                    index = toolCallData.index ?: 0,
                                     delta = Delta(toolCalls = listOf(toolCall))
                                 ))
                             ))
-                        } else if (progressData.status == "completed" && progressData.toolCallId.isNotEmpty()) {
-                            // Tool completed - remove from pending
-                            pendingHermesToolCalls.remove(progressData.toolCallId)
+                        } catch (e: Exception) {
+                            // Skip malformed tool_call events
                         }
-                    } catch (e: Exception) {
-                        // Skip malformed hermes.tool.progress events
                     }
-                    // Reset event type after processing
-                    currentEventType = null
-                }
 
-                line.startsWith("data: ") -> {
-                    val payload = line.removePrefix("data: ").trim()
-                    if (dataBuffer.isNotEmpty()) {
-                        dataBuffer.append(payload)
-                    } else {
-                        dataBuffer.append(payload)
-                    }
-                }
-
-                line.startsWith("data:") -> {
-                    val payload = line.removePrefix("data:").trim()
-                    dataBuffer.append(payload)
-                }
-
-                line.isBlank() -> {
-                    // Blank line signals end of an event
-                    if (dataBuffer.isNotEmpty()) {
-                        val data = dataBuffer.toString()
-                        dataBuffer.clear()
+                    // Parse Hermes-specific hermes.tool.progress events
+                    currentEventType == "hermes.tool.progress" && line.startsWith("data: ") -> {
                         try {
-                            val delta = json.decodeFromString<StreamDelta>(data)
-                            emit(delta)
-                        } catch (_: Exception) {
-                            // Skip malformed data, continue streaming
+                            val payload = line.removePrefix("data: ").trim()
+                            val progressData = json.decodeFromString<HermesToolProgressData>(payload)
+                            
+                            // Only emit tool call delta on "running" status
+                            if (progressData.status == "running" && progressData.tool.isNotEmpty()) {
+                                // Track the tool call for later completion
+                                if (progressData.toolCallId.isNotEmpty()) {
+                                    pendingHermesToolCalls[progressData.toolCallId] = progressData.tool
+                                }
+                                
+                                // Emit a StreamDelta with tool_calls to trigger UI
+                                val toolCall = ToolCall(
+                                    id = progressData.toolCallId,
+                                    type = "function",
+                                    function = FunctionCall(
+                                        name = progressData.tool,
+                                        arguments = ""
+                                    ),
+                                    index = null
+                                )
+                                emit(StreamDelta(
+                                    id = "",
+                                    choices = listOf(com.hermes.intellij.api.models.StreamChoice(
+                                        index = 0,
+                                        delta = Delta(toolCalls = listOf(toolCall))
+                                    ))
+                                ))
+                            } else if (progressData.status == "completed" && progressData.toolCallId.isNotEmpty()) {
+                                // Tool completed - remove from pending
+                                pendingHermesToolCalls.remove(progressData.toolCallId)
+                            }
+                        } catch (e: Exception) {
+                            // Skip malformed hermes.tool.progress events
+                        }
+                        // Reset event type after processing
+                        currentEventType = null
+                    }
+
+                    line.startsWith("data: ") -> {
+                        val payload = line.removePrefix("data: ").trim()
+                        if (dataBuffer.isNotEmpty()) {
+                            dataBuffer.append(payload)
+                        } else {
+                            dataBuffer.append(payload)
                         }
                     }
-                    // Reset event type after blank line
-                    currentEventType = null
+
+                    line.startsWith("data:") -> {
+                        val payload = line.removePrefix("data:").trim()
+                        dataBuffer.append(payload)
+                    }
+
+                    line.isBlank() -> {
+                        // Blank line signals end of an event
+                        if (dataBuffer.isNotEmpty()) {
+                            val data = dataBuffer.toString()
+                            dataBuffer.clear()
+                            try {
+                                val delta = json.decodeFromString<StreamDelta>(data)
+                                emit(delta)
+                            } catch (_: Exception) {
+                                // Skip malformed data, continue streaming
+                            }
+                        }
+                        // Reset event type after blank line
+                        currentEventType = null
+                    }
+
+                    line.startsWith(":") -> {
+                        // SSE comment, ignore (unless it's a tool_call which is handled above)
+                    }
+
+                    // Ignore event:, id:, retry: lines (event: is handled above)
+                    else -> {}
                 }
+            }
 
-                line.startsWith(":") -> {
-                    // SSE comment, ignore (unless it's a tool_call which is handled above)
+            // Flush any remaining buffered data
+            if (dataBuffer.isNotEmpty()) {
+                val data = dataBuffer.toString()
+                try {
+                    val delta = json.decodeFromString<StreamDelta>(data)
+                    emit(delta)
+                } catch (_: Exception) {
+                    // Skip malformed trailing data
                 }
-
-                // Ignore event:, id:, retry: lines (event: is handled above)
-                else -> {}
             }
-        }
-
-        // Flush any remaining buffered data
-        if (dataBuffer.isNotEmpty()) {
-            val data = dataBuffer.toString()
-            try {
-                val delta = json.decodeFromString<StreamDelta>(data)
-                emit(delta)
-            } catch (_: Exception) {
-                // Skip malformed trailing data
-            }
+        } finally {
+            // FIX (BUG-004): Explicit state cleanup for better code clarity
+            // and to handle edge cases where the flow might be cancelled unexpectedly.
+            pendingHermesToolCalls.clear()
+            dataBuffer.clear()
+            currentEventType = null
         }
     }
 }

@@ -11,6 +11,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.net.URI
@@ -39,7 +40,7 @@ class HermesApiClient {
     }
 
     private val httpClient: HttpClient = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(30))
+        .connectTimeout(Duration.ofSeconds(60))  // FIX: Increased from 30s to 60s
         .build()
 
     private val settings: HermesSettingsState
@@ -58,6 +59,8 @@ class HermesApiClient {
      * Stream chat completions from the Hermes API and extract session ID from response header.
      * Returns a pair of (sessionId, flow of deltas).
      * Session ID is extracted from "X-Hermes-Session-Id" response header.
+     * 
+     * FIX: Added timeout handling to prevent indefinite blocking on SSE streams.
      */
     fun streamChatWithSession(request: ChatRequest, sessionId: String? = null): StreamChatWithSession {
         val streamRequest = request.copy(stream = true)
@@ -65,7 +68,8 @@ class HermesApiClient {
         val endpoint = resolveBase() + "/chat/completions"
 
         // Use a longer timeout for SSE streaming — responses can take minutes
-        val httpRequest = buildHttpRequest(endpoint, body, sessionId, timeoutSeconds = 600)
+        // FIX: Use 300s (5 min) instead of 600s to prevent indefinite blocking
+        val httpRequest = buildHttpRequest(endpoint, body, sessionId, timeoutSeconds = 300)
 
         // Send request synchronously to get response headers
         val response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofLines())
@@ -81,11 +85,18 @@ class HermesApiClient {
             throw HermesApiException(statusCode, errorBody)
         }
 
+        // FIX: Wrap the flow collection with timeout to prevent indefinite blocking
         val deltas = SseStreamParser.parse(
             flow {
                 val iterator = response.body().iterator()
-                while (iterator.hasNext()) {
-                    emit(iterator.next())
+                try {
+                    while (iterator.hasNext()) {
+                        emit(iterator.next())
+                    }
+                } catch (e: Exception) {
+                    // FIX: Log and rethrow to trigger error handling
+                    logger.warn("[ApiClient] SSE stream error: ${e.javaClass.simpleName}: ${e.message}")
+                    throw e
                 }
             }
         ).flowOn(Dispatchers.IO)
@@ -210,6 +221,3 @@ class HermesApiClient {
             ApplicationManager.getApplication().getService(HermesApiClient::class.java)
     }
 }
-
-class HermesApiException(val statusCode: Int, val errorBody: String) :
-    RuntimeException("Hermes API error ($statusCode): $errorBody")

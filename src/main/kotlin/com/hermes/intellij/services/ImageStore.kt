@@ -86,12 +86,22 @@ object ImageStore {
     
     /**
      * Load or create the image index for a conversation.
-     * Thread-safe with caching.
+     * Thread-safe with caching and cache validity check.
+     * 
+     * FIX (BUG-001): Added cache validity check - if the index file was deleted
+     * by another thread, the cache is invalidated and reloaded.
      */
     private fun loadIndex(project: Project, conversationId: String): ImageIndex {
         synchronized(indexLock) {
-            // Check cache first
-            indexCache[conversationId]?.let { return it }
+            // Check cache first with validity check
+            indexCache[conversationId]?.let { cached ->
+                val indexFile = getIndexFile(project, conversationId)
+                if (indexFile.exists()) {
+                    return cached
+                }
+                // Cache invalid - file was deleted, remove from cache
+                indexCache.remove(conversationId)
+            }
             
             val indexFile = getIndexFile(project, conversationId)
             val index = if (indexFile.exists()) {
@@ -288,6 +298,9 @@ object ImageStore {
     /**
      * Delete all images for a conversation.
      * Also removes the index file and clears cache.
+     * 
+     * FIX (BUG-001): Cache is cleared within the synchronized block to ensure
+     * atomicity with other operations.
      */
     fun deleteConversationImages(project: Project, conversationId: String) {
         synchronized(indexLock) {
@@ -297,6 +310,7 @@ object ImageStore {
                     dir.deleteRecursively()
                     LOG.info("[ImageStore] Deleted images for conversation: $conversationId")
                 }
+                // Clear cache atomically
                 indexCache.remove(conversationId)
             } catch (e: Exception) {
                 LOG.warn("[ImageStore] Failed to delete images: ${e.message}", e)
