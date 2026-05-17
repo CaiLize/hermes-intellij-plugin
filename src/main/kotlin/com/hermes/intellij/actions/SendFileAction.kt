@@ -7,6 +7,8 @@ import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.wm.ToolWindowManager
+import java.awt.Component
+import javax.swing.JOptionPane
 
 /**
  * Sends the entire current file to the Hermes AI chat panel as context.
@@ -29,6 +31,26 @@ class SendFileAction : AnAction("Send File to Hermes", "Send current file as con
 
         val language = virtualFile.fileType.name.lowercase()
         val filePath = virtualFile.path
+
+        // FIX: VULN-016 - 敏感文件检查
+        if (com.hermes.intellij.security.FileSecurityValidator.isSensitiveFile(filePath)) {
+            val fileName = filePath.substringAfterLast('/')
+            val message = buildString {
+                append("⚠️ 检测到敏感文件：$fileName\n\n")
+                append("该文件可能包含敏感信息（如密钥、凭证等）。\n")
+                append("确定要发送到 Hermes AI 吗？")
+            }
+            val result = JOptionPane.showConfirmDialog(
+                null as Component?,
+                message,
+                "安全警告",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE
+            )
+            if (result != JOptionPane.YES_OPTION) {
+                return
+            }
+        }
 
         val context = CodeContext(
             filePath = filePath,

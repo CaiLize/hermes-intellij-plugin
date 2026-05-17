@@ -7,6 +7,7 @@ import com.hermes.intellij.api.models.ChatRequest
 import com.hermes.intellij.api.models.FileAttachmentData
 import com.hermes.intellij.api.models.FunctionDefinition
 import com.hermes.intellij.api.models.MessageSegment
+import com.hermes.intellij.api.models.ToolCall
 import com.hermes.intellij.api.models.ToolCallRecord
 import com.hermes.intellij.api.models.ToolDefinition
 import com.hermes.intellij.model.CodeContext
@@ -21,9 +22,12 @@ import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.net.ConnectException
+import java.net.SocketException
+import java.net.SocketTimeoutException
 
 @Service(Service.Level.PROJECT)
 class HermesChatService(private val project: Project) {
@@ -32,9 +36,9 @@ class HermesChatService(private val project: Project) {
     private val conversationManager = ConversationManager(project)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var currentJob: Job? = null
-    
-    // 工具调用历史记录（按顺序保存）
-    private val pendingToolCalls = mutableListOf<ToolCallRecord>()
+
+    // FIX: Use centralized state machine instead of scattered trackers
+    private val toolCallStateMachine = ToolCallStateMachine()
 
     init {
         conversationManager.setProjectInfo(project.name)
@@ -45,7 +49,8 @@ class HermesChatService(private val project: Project) {
         contexts: List<CodeContext>,
         files: List<FileAttachment>,
         images: List<ImageContext>,
-        chatPanel: ChatPanel
+        chatPanel: ChatPanel,
+        stateListener: ToolCallStateMachine.StateChangeListener? = null
     ) {
         // Update current file info
         val editor = FileEditorManager.getInstance(project).selectedTextEditor
@@ -69,10 +74,9 @@ class HermesChatService(private val project: Project) {
             val fileInfo = ConversationManager.CodeContextInfo(
                 filePath = it.filePath,
                 lineRange = it.lineRange,
-                content = it.content, // 文件内容需要发送到 API
+                content = it.content,
                 language = it.language
             )
-            // 仅记录文件名和大小，不记录内容
             logger.info("[HermesChat] File attached: ${it.fileName}, contentLen=${it.content.length}")
             fileInfo
         }
@@ -91,8 +95,11 @@ class HermesChatService(private val project: Project) {
         val tools = buildToolDefinitions()
         logger.info("[HermesChat] Tool definitions: ${tools.size} tools declared")
 
-        // Clear pending tool calls
-        pendingToolCalls.clear()
+        // Clear pending tool calls — state machine handles its own cleanup
+        toolCallStateMachine.startStream()
+
+        // Register state listener for this request
+        stateListener?.let { toolCallStateMachine.addListener(it) }
 
         // Build the ChatRequest
         val request = ChatRequest(
@@ -119,38 +126,57 @@ class HermesChatService(private val project: Project) {
         }
 
         val responseBuilder = StringBuilder()
-        var hasCompleted = false  // FIX: Track if streaming completed normally
+        var hasCompleted = false
+        var hasError = false
 
         currentJob = scope.launch {
             try {
                 val apiClient = HermesApiClient.getInstance()
-                
+
                 // Get current session ID (if we're continuing a conversation)
                 val currentSessionId = conversationManager.getCurrentSessionId()
                 logger.info("[HermesChat] Using session ID: $currentSessionId")
-                
+
                 // Call new API that extracts session ID from response header
                 val result = apiClient.streamChatWithSession(request, currentSessionId)
-                
-                // Save session ID immediately (from response header)
+
+                // FIX: Issue #6 - Validate session ID before saving
                 if (result.sessionId != null) {
                     logger.info("[HermesChat] Received new session ID: ${result.sessionId}")
-                    conversationManager.setHermesSessionId(result.sessionId)
+                    // Validate session ID format before accepting
+                    val sessionIdValidation = com.hermes.intellij.security.SessionSecurityValidator.validateSessionId(result.sessionId)
+                    if (sessionIdValidation.isValid) {
+                        conversationManager.setHermesSessionId(result.sessionId)
+                    } else {
+                        logger.warn("[HermesChat] Invalid session ID from server: ${sessionIdValidation.toString()}, ignoring")
+                    }
                 }
-                
+
+                // FIX: Issue #1 - Use withContext(Dispatchers.Main) for all UI updates
+                // This ensures ordered execution and proper thread switching
                 result.deltas
+                    .flowOn(Dispatchers.IO)
                     .catch { e ->
+                        // FIX: Better error categorization for stream interruptions
                         val errorMsg = when (e) {
                             is ConnectException -> {
-                                "Cannot connect to Hermes at ${settings.apiEndpoint}. Is hermes gateway running?"
+                                "无法连接到 Hermes 服务 (${settings.apiEndpoint})。请检查服务是否正在运行。"
+                            }
+                            is SocketTimeoutException -> {
+                                "连接超时。服务器响应太慢，请检查网络连接或服务器状态。"
+                            }
+                            is SocketException -> {
+                                "网络连接中断: ${e.message}。可能是网络不稳定或服务器关闭了连接。"
                             }
                             is HermesApiException -> {
                                 when {
-                                    e.statusCode == 401 -> "Authentication failed. Check your API key in Settings."
-                                    e.statusCode == 403 -> "Access forbidden. Check your permissions."
-                                    e.statusCode == 404 -> "API endpoint not found. Check your endpoint URL."
-                                    e.statusCode in 500..599 -> "Server error (${e.statusCode}). The Hermes service may be experiencing issues."
-                                    else -> "API error (${e.statusCode}). Check logs for details."
+                                    e.statusCode == 401 -> "认证失败。请检查设置中的 API Key。"
+                                    e.statusCode == 403 -> "访问被拒绝。请检查权限设置。"
+                                    e.statusCode == 404 -> "API 端点未找到。请检查端点 URL。"
+                                    e.statusCode == 413 -> "请求体过大。请减少对话历史或压缩图片。"
+                                    e.statusCode == 500 -> "服务器内部错误 (${e.statusCode})。请稍后重试。"
+                                    e.statusCode in 502..504 -> "网关错误 (${e.statusCode})。Hermes 服务可能正在重启。"
+                                    else -> "API 错误 (${e.statusCode})。请查看日志获取详细信息。"
                                 }
                             }
                             is CancellationException -> {
@@ -158,89 +184,80 @@ class HermesChatService(private val project: Project) {
                                 logger.info("[HermesChat] Stream cancelled: ${e.message}")
                                 throw e  // Re-throw to trigger cancellation handler
                             }
-                            else -> {
+                            is Exception -> {
                                 logger.warn("[HermesChat] Stream error: ${e.javaClass.simpleName}: ${e.message}")
-                                "Error: ${e.message}"
+                                "流式响应中断: ${e.javaClass.simpleName}。请检查网络连接，然后重试。"
+                            }
+                            else -> {
+                                logger.warn("[HermesChat] Unexpected stream error: ${e.javaClass.simpleName}: ${e.message}")
+                                "发生未知错误: ${e.message}"
                             }
                         }
-                        
-                        // 不记录完整的异常堆栈和响应体，避免泄露敏感信息
+
+                        // Mark that we had an error
+                        hasError = true
+
+                        // FIX: Don't log full stack trace to avoid exposing sensitive info
                         if (e !is CancellationException) {
                             logger.warn("Hermes streaming error: ${e.javaClass.simpleName} (status=${if (e is HermesApiException) e.statusCode else "N/A"})")
                         }
-                        
-                        ApplicationManager.getApplication().invokeLater {
+
+                        // FIX: Issue #1 - Use withContext for thread-safe UI update
+                        withContext(Dispatchers.Main) {
                             chatPanel.onStreamingError(errorMsg)
                         }
                     }
                     .collect { delta ->
-                        // Log delta for debugging tool call visibility
-                        logger.info("[HermesChat] Received delta: choices=${delta.choices.size}, hasToolCalls=${delta.choices.any { it.delta.toolCalls != null }}, hasContent=${delta.choices.any { it.delta.content != null }}")
-                        
-                        for (choice in delta.choices) {
-                            // Handle tool_calls
-                            choice.delta.toolCalls?.forEach { toolCall ->
-                                val toolName = toolCall.function?.name ?: "unknown"
-                                val toolArgs = toolCall.function?.arguments ?: ""
-                                logger.info("[HermesChat] Tool call detected: $toolName, args=${toolArgs.take(100)}")
-                                
-                                
-                                // Add to pending tool calls
-                                pendingToolCalls.add(ToolCallRecord(
-                                    name = toolName,
-                                    status = "Running...",
-                                    arguments = toolArgs,
-                                    completed = false
-                                ))
-                                
-                                logger.info("[HermesChat] Showing tool call UI: $toolName (pending=${pendingToolCalls.size})")
-                                ApplicationManager.getApplication().invokeLater {
-                                    chatPanel.onToolCall(toolName, "Running...")
-                                }
-                            }
+                        // FIX: Issue #1 - All UI updates happen in Dispatchers.Main context
+                        withContext(Dispatchers.Main) {
+                            // Log delta for debugging tool call visibility
+                            logger.info("[HermesChat] Received delta: choices=${delta.choices.size}, hasToolCalls=${delta.choices.any { it.delta.toolCalls != null }}, hasContent=${delta.choices.any { it.delta.content != null }}")
 
-                            // Handle content - mark all pending tool calls as complete
-                            val content = choice.delta.content
-                            if (content != null) {
-                                if (pendingToolCalls.isNotEmpty()) {
-                                    // Mark all pending tool calls as complete before showing content
-                                    val completedTools = pendingToolCalls.map { it.copy(completed = true, status = "completed") }
-                                    pendingToolCalls.clear()
-                                    pendingToolCalls.addAll(completedTools)
-                                    
-                                    logger.info("[HermesChat] Marking ${completedTools.size} tool(s) as complete, starting content display")
-                                    ApplicationManager.getApplication().invokeLater {
-                                        completedTools.forEach { tool ->
-                                            chatPanel.onToolCallComplete(tool.name)
-                                        }
-                                    }
+                            for (choice in delta.choices) {
+                                // Handle tool_calls - register with state machine
+                                choice.delta.toolCalls?.forEach { toolCall ->
+                                    val toolName = toolCall.function?.name ?: "unknown"
+                                    val toolArgs = toolCall.function?.arguments ?: ""
+                                    logger.info("[HermesChat] Tool call detected: $toolName, args=${toolArgs.take(100)}")
+
+                                    // FIX: Use state machine for tracking — adds UI notification via listener
+                                    val record = toolCallStateMachine.addToolCall(toolCall, toolArgs)
+
+                                    logger.info("[HermesChat] Tool call registered: id=${record.id}, name=$toolName, pending=${toolCallStateMachine.getRunningCount()}")
+                                    // UI update is handled by ChatPanelStateListener
                                 }
-                                
-                                responseBuilder.append(content)
-                                ApplicationManager.getApplication().invokeLater {
+
+                                // Handle content — mark all running tool calls as complete
+                                val content = choice.delta.content
+                                if (content != null) {
+                                    if (toolCallStateMachine.hasRunning()) {
+                                        // FIX: Use state machine — idempotent, thread-safe
+                                        val completedTools = toolCallStateMachine.markAllCompleted()
+
+                                        logger.info("[HermesChat] Marking ${completedTools.size} tool(s) as complete via state machine, starting content display")
+                                        // UI update is handled by ChatPanelStateListener
+                                    }
+
+                                    responseBuilder.append(content)
                                     chatPanel.onTokenReceived(content)
                                 }
                             }
                         }
                     }
 
-                // Mark any remaining pending tool calls as complete
-                if (pendingToolCalls.isNotEmpty()) {
-                    val completedTools = pendingToolCalls.map { it.copy(completed = true, status = "completed") }
-                    pendingToolCalls.clear()
-                    pendingToolCalls.addAll(completedTools)
-                    
-                    ApplicationManager.getApplication().invokeLater {
-                        completedTools.forEach { tool ->
-                            chatPanel.onToolCallComplete(tool.name)
-                        }
-                    }
+                // FIX: State machine cleanup after stream ends
+                if (toolCallStateMachine.hasRunning()) {
+                    val completedTools = toolCallStateMachine.markAllCompleted()
+                    // UI updates handled by listener
+
+                    logger.info("[HermesChat] Post-stream cleanup: ${completedTools.size} remaining tool(s) marked complete")
                 }
 
+                toolCallStateMachine.endStream(hasError = hasError)
+
                 val fullResponse = responseBuilder.toString()
-                if (fullResponse.isNotEmpty()) {
+                if (fullResponse.isNotEmpty() && !hasError) {
                     // Save user message with full attachment info for persistence
-                    // 合并 codeContextInfos 和 fileInfos（两者都包含文件信息）
                     val allFileAttachments = codeContextInfos.map { ctx ->
                         FileAttachmentData(
                             filePath = ctx.filePath,
@@ -254,54 +271,60 @@ class HermesChatService(private val project: Project) {
                             language = file.language
                         )
                     }
-                    // 注意：保存时只用原始 prompt 作为显示文本，不包含代码上下文内容
-                    // 代码上下文和文件内容仅用于 API 请求，文件信息通过 fileAttachments 持久化
-                    
+
                     // FIX: Use segments for user message to preserve order of text, images, files
                     val userSegments = buildUserMessageSegments(prompt, imageBase64Urls, allFileAttachments)
                     conversationManager.addUserMessageWithSegments(
                         text = prompt,
                         segments = userSegments
                     )
-                    
-                    // Save assistant message with ordered segments (FIX: preserves tool call order)
-                    // Get segments from the streaming bubble to preserve chronological order
+
+                    // Save assistant message with ordered segments
                     val assistantSegments = chatPanel.messageListPanel.getStreamingSegments()
-                    val toolCallRecords = if (pendingToolCalls.isNotEmpty()) {
-                        pendingToolCalls.toList()
+                    val toolCallRecords = if (!toolCallStateMachine.isEmpty()) {
+                        toolCallStateMachine.getAllRecords().map { r ->
+                            ToolCallRecord(
+                                name = r.name,
+                                arguments = r.arguments,
+                                status = when (r.status) {
+                                    ToolCallStateMachine.ToolCallStatus.RUNNING -> "running"
+                                    ToolCallStateMachine.ToolCallStatus.COMPLETED -> "completed"
+                                    ToolCallStateMachine.ToolCallStatus.CANCELLED -> "cancelled"
+                                },
+                                completed = r.status != ToolCallStateMachine.ToolCallStatus.RUNNING
+                            )
+                        }
                     } else null
                     conversationManager.addAssistantMessageWithSegments(
                         content = fullResponse,
                         segments = assistantSegments,
-                        toolCalls = toolCallRecords  // Keep for backward compatibility
+                        toolCalls = toolCallRecords
                     )
-                    
+
                     // Persist after each exchange
                     conversationManager.saveCurrentConversation()
                 }
 
-                hasCompleted = true  // FIX: Mark as completed normally
-                ApplicationManager.getApplication().invokeLater {
+                hasCompleted = true
+                withContext(Dispatchers.Main) {
                     chatPanel.onStreamingComplete()
                 }
             } catch (e: CancellationException) {
-                // FIX: Handle cancellation separately - don't show error to user
                 logger.info("[HermesChat] Request cancelled: ${e.message}")
-                
-                // Mark any remaining pending tool calls as complete
-                if (pendingToolCalls.isNotEmpty()) {
-                    val completedTools = pendingToolCalls.map { it.copy(completed = true, status = "completed") }
-                    ApplicationManager.getApplication().invokeLater {
-                        completedTools.forEach { tool ->
-                            chatPanel.onToolCallComplete(tool.name)
-                        }
+
+                // FIX: Use state machine for cancellation — idempotent, thread-safe
+                val cancelledTools = toolCallStateMachine.markAllCancelled()
+                toolCallStateMachine.endStream(hasError = false)
+
+                withContext(Dispatchers.Main) {
+                    cancelledTools.forEach { tool ->
+                        chatPanel.onToolCallComplete(tool.name) // UI shows cancelled state
                     }
                 }
-                
+
                 // Save partial conversation on cancel
                 val partial = responseBuilder.toString()
                 if (partial.isNotEmpty()) {
-                    // 合并 codeContextInfos 和 fileInfos
                     val allFileAttachments = codeContextInfos.map { ctx ->
                         FileAttachmentData(
                             filePath = ctx.filePath,
@@ -315,60 +338,66 @@ class HermesChatService(private val project: Project) {
                             language = file.language
                         )
                     }
-                    // 同上：只保存原始 prompt，不包含代码上下文内容
-                    
-                    // FIX: Use segments for user message even on cancel
+
                     val userSegments = buildUserMessageSegments(prompt, imageBase64Urls, allFileAttachments)
                     conversationManager.addUserMessageWithSegments(
                         text = prompt,
                         segments = userSegments
                     )
-                    
-                    // Save assistant message with tool call history (mark all as complete on cancel)
-                    // Get segments from the streaming bubble
+
                     val assistantSegments = chatPanel.messageListPanel.getStreamingSegments()
-                    val toolCallRecords = if (pendingToolCalls.isNotEmpty()) {
-                        pendingToolCalls.map { it.copy(completed = true, status = "completed") }
-                    } else null
+                    val toolCallRecords = toolCallStateMachine.getAllRecords().map { r ->
+                        ToolCallRecord(
+                            name = r.name,
+                            arguments = r.arguments,
+                            status = "cancelled",
+                            completed = true
+                        )
+                    }
                     conversationManager.addAssistantMessageWithSegments(
-                        content = partial + "\n\n*(Response cancelled)*",
+                        content = partial + "\n\n*(响应已取消)*",
                         segments = assistantSegments,
                         toolCalls = toolCallRecords
                     )
-                    
+
                     conversationManager.saveCurrentConversation()
                 }
-                
+
                 // FIX: Explicitly call onCancelStreaming to clean up UI state
-                ApplicationManager.getApplication().invokeLater {
+                withContext(Dispatchers.Main) {
                     chatPanel.onCancelStreaming()
                 }
             } catch (e: Exception) {
-                // Mark any remaining pending tool calls as complete
-                if (pendingToolCalls.isNotEmpty()) {
-                    val completedTools = pendingToolCalls.map { it.copy(completed = true, status = "completed") }
-                    ApplicationManager.getApplication().invokeLater {
-                        completedTools.forEach { tool ->
-                            chatPanel.onToolCallComplete(tool.name)
-                        }
+                // FIX: Use state machine for error cleanup — idempotent, thread-safe
+                val erroredTools = toolCallStateMachine.markAllCancelled()
+                toolCallStateMachine.endStream(hasError = true)
+
+                withContext(Dispatchers.Main) {
+                    erroredTools.forEach { tool ->
+                        chatPanel.onToolCallComplete(tool.name)
                     }
                 }
-                
+
                 logger.warn("[HermesChat] Unexpected error", e)
-                ApplicationManager.getApplication().invokeLater {
-                    chatPanel.onStreamingError("Unexpected error: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    val errorMsg = when (e) {
+                        is SocketTimeoutException -> "请求超时。服务器响应太慢，请检查网络连接。"
+                        is SocketException -> "网络连接错误: ${e.message}。请检查网络后重试。"
+                        else -> "发生错误: ${e.message}"
+                    }
+                    chatPanel.onStreamingError(errorMsg)
                 }
             } finally {
                 // FIX: Always clean up, regardless of how the coroutine ended
-                // This prevents the "input box stuck in disabled state" bug
                 currentJob = null
-                pendingToolCalls.clear()
-                
-                // Only call onStreamingComplete if we didn't already handle completion/cancellation
-                if (!hasCompleted) {
-                    logger.info("[HermesChat] Finally block cleaning up (hasCompleted=$hasCompleted)")
-                    ApplicationManager.getApplication().invokeLater {
-                        // Only finalize if not already finalized by onStreamingComplete or onCancelStreaming
+                stateListener?.let { toolCallStateMachine.removeListener(it) }
+                toolCallStateMachine.clear()
+
+                // Only call onStreamingComplete if we didn't already handle completion/cancellation/error
+                if (!hasCompleted && !hasError) {
+                    logger.info("[HermesChat] Finally block cleaning up (hasCompleted=$hasCompleted, hasError=$hasError)")
+                    withContext(Dispatchers.Main) {
+                        // Only finalize if not already finalized
                         if (chatPanel.messageListPanel.getStreamingBubble() != null) {
                             chatPanel.onStreamingComplete()
                         }
@@ -388,15 +417,14 @@ class HermesChatService(private val project: Project) {
         fileAttachments: List<FileAttachmentData>
     ): List<MessageSegment> {
         val segments = mutableListOf<MessageSegment>()
-        
+
         // Start with text
         if (text.isNotBlank()) {
             segments.add(MessageSegment.Text(text))
         }
-        
+
         // Add images in order
         for (base64Url in imageBase64Urls) {
-            // Extract base64 data from data URL
             val base64Data = if (base64Url.startsWith("data:")) {
                 base64Url.substringAfter(",")
             } else {
@@ -406,7 +434,7 @@ class HermesChatService(private val project: Project) {
                 segments.add(MessageSegment.Image(base64Data = base64Data))
             }
         }
-        
+
         // Add files in order
         for (file in fileAttachments) {
             segments.add(MessageSegment.File(
@@ -416,7 +444,7 @@ class HermesChatService(private val project: Project) {
                 language = file.language
             ))
         }
-        
+
         return segments
     }
 
@@ -470,11 +498,9 @@ class HermesChatService(private val project: Project) {
      * This performs I/O and should be called from a background thread.
      */
     fun ensureConversation(): String {
-        // Load last conversation if we haven't loaded one yet
         if (conversationManager.getCurrentConversationId() == null) {
             conversationManager.loadLastConversation()
         }
-        // Still no conversation? Create a new one
         if (conversationManager.getCurrentConversationId() == null) {
             return conversationManager.createConversation()
         }
@@ -487,7 +513,7 @@ class HermesChatService(private val project: Project) {
      */
     private fun buildToolDefinitions(): List<ToolDefinition> {
         val json = Json { encodeDefaults = true }
-        
+
         return listOf(
             // web_search tool
             ToolDefinition(

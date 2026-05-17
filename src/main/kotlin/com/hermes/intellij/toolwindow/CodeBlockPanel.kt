@@ -147,6 +147,17 @@ class CodeBlockPanel(
      * 支持多选区替换：所有选区都会被替换为相同的代码。
      */
     private fun insertOrReplace() {
+        // FIX: VULN-015 - 代码内容安全验证
+        val codeValidation = com.hermes.intellij.security.CodeSecurityValidator.validateCode(code, language)
+        if (!codeValidation.isValid) {
+            JOptionPane.showMessageDialog(
+                this,
+                "代码安全检查未通过：${codeValidation.toString()}",
+                "安全警告",
+                JOptionPane.WARNING_MESSAGE
+            )
+            return
+        }
         val editor = FileEditorManager.getInstance(project).selectedTextEditor ?: return
         WriteCommandAction.runWriteCommandAction(project, "Hermes AI: Insert Code", null, {
             // 获取所有选区，支持多选区（Ctrl+多选）
@@ -183,6 +194,17 @@ class CodeBlockPanel(
      * 文件扩展名根据代码块语言自动推断。
      */
     private fun createNewFile() {
+        // FIX: VULN-015 - 代码内容和文件名安全验证
+        val codeValidation = com.hermes.intellij.security.CodeSecurityValidator.validateCode(code, language)
+        if (!codeValidation.isValid) {
+            JOptionPane.showMessageDialog(
+                this,
+                "代码安全检查未通过：${codeValidation.toString()}",
+                "安全警告",
+                JOptionPane.WARNING_MESSAGE
+            )
+            return
+        }
         val editor = FileEditorManager.getInstance(project).selectedTextEditor
         val currentFile = editor?.virtualFile
         val parentDir = if (currentFile != null && !currentFile.isDirectory) {
@@ -194,6 +216,18 @@ class CodeBlockPanel(
         val ext = languageToExtension(language)
         val baseName = "untitled"
         val fileName = "$baseName.$ext"
+
+        // FIX: VULN-015 - 验证文件名安全性
+        val filenameValidation = com.hermes.intellij.security.CodeSecurityValidator.validateFileName(fileName)
+        if (!filenameValidation.isValid) {
+            JOptionPane.showMessageDialog(
+                this,
+                "文件名不安全：${filenameValidation.toString()}",
+                "安全警告",
+                JOptionPane.WARNING_MESSAGE
+            )
+            return
+        }
 
         // 在父目录中找一个不重名的文件名
         var finalName = fileName

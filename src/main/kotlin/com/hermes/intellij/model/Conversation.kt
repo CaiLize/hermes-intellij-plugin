@@ -32,7 +32,7 @@ data class Conversation(
             // Strip code blocks and whitespace, take first meaningful line
             val cleaned = firstMessage
                 .replace(Regex("```[\\s\\S]*?```"), "")
-                .replace(Regex("\\n\\s*\\n"), "\n")
+                .replace(Regex("\n\\s*\n"), "\n")
                 .lines()
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }

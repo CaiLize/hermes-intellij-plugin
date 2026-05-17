@@ -242,6 +242,11 @@ class MessageListPanel(private val project: Project) : JPanel(BorderLayout()) {
         revalidateAndScroll()
     }
 
+    fun cancelToolCall(toolName: String) {
+        streamingBubble?.cancelToolCall(toolName)
+        revalidateAndScroll()
+    }
+
     fun finalizeStreaming() {
         streamingBubble?.finalizeMessage()
         streamingBubble = null

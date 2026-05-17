@@ -8,6 +8,7 @@ import com.hermes.intellij.model.ImageAttachment
 import com.hermes.intellij.model.ImageContext
 import com.hermes.intellij.model.MessageContent
 import com.hermes.intellij.services.HermesChatService
+import com.hermes.intellij.toolwindow.ChatPanelStateListener
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.IconLoader
 import com.intellij.ui.JBColor
@@ -298,7 +299,11 @@ class ChatPanel(private val project: Project) : JPanel(BorderLayout()) {
         isStreaming = true
 
         val chatService = HermesChatService.getInstance(project)
-        chatService.sendMessage(text, contexts, files, images, this)
+
+        // Create state listener and pass it to sendMessage — ensures all tool call events are captured
+        val stateListener = ChatPanelStateListener(this)
+
+        chatService.sendMessage(text, contexts, files, images, this, stateListener)
 
         // Update title bar after sending first message
         SwingUtilities.invokeLater {
@@ -342,7 +347,7 @@ class ChatPanel(private val project: Project) : JPanel(BorderLayout()) {
     fun onCancelStreaming() {
         val chatService = HermesChatService.getInstance(project)
         chatService.cancelCurrentRequest()
-        // 标记所有工具调用为中断状态
+        // 标记所有工具调用为中断状态 — 通过状态机统一处理
         messageListPanel.getStreamingBubble()?.cancelAllToolCalls()
         // 先追加取消提示，再 finalize（顺序不能颠倒：finalizeStreaming 会把 streamingBubble 置 null）
         messageListPanel.appendToken("\n\n*(Response cancelled)*")
@@ -367,6 +372,13 @@ class ChatPanel(private val project: Project) : JPanel(BorderLayout()) {
      */
     fun onToolCallComplete(toolName: String) {
         messageListPanel.completeToolCall(toolName)
+    }
+
+    /**
+     * 标记工具调用被取消
+     */
+    fun onToolCallCancelled(toolName: String) {
+        messageListPanel.cancelToolCall(toolName)
     }
 
     /**

@@ -275,6 +275,21 @@ class MessageBubble(
         }
     }
 
+    /**
+     * Cancel a tool call - mark as cancelled
+     */
+    fun cancelToolCall(toolName: String) {
+        val lastIndex = contentSegments.indexOfLast { seg ->
+            seg is ContentSegment.ToolCall && seg.name == toolName && !seg.completed && !seg.cancelled
+        }
+        
+        if (lastIndex >= 0) {
+            val existing = contentSegments[lastIndex] as ContentSegment.ToolCall
+            contentSegments[lastIndex] = existing.copy(cancelled = true, status = "Cancelled")
+            renderStreamingContent()
+        }
+    }
+
     private fun getToolIcon(toolName: String): String = when {
         toolName.contains("search", ignoreCase = true) -> "🔍"
         toolName.contains("read", ignoreCase = true) -> "📖"

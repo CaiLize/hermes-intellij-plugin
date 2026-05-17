@@ -32,6 +32,11 @@ dependencies {
 
 kotlin {
     jvmToolchain(17)
+    // 排除错误的目录 com/hermes/model/（重复的 Conversation.kt）
+    sourceSets.all {
+        kotlin.srcDirs("src/main/kotlin")
+        kotlin.exclude("**/com/hermes/model/**")
+    }
 }
 
 intellijPlatform {
@@ -58,6 +63,11 @@ tasks {
 
     wrapper {
         gradleVersion = "8.14.4"
+    }
+
+    // 修复 WSL2 环境下 buildSearchableOptions 任务失败的问题
+    buildSearchableOptions {
+        enabled = false
     }
 
     // 构建完成后自动将分发包复制到 release/ 目录

@@ -198,10 +198,24 @@ class ImagePreviewDialog(
     }
 
     companion object {
+        // P0: 防止资源耗尽攻击 - Base64 数据大小限制（5MB）
+        private const val MAX_BASE64_SIZE = 5 * 1024 * 1024
+
         /**
          * 从 base64 数据创建图片预览对话框。
          */
         fun showFromBase64(parent: Component?, base64Data: String) {
+            // P0: 添加大小检查，防止 DoS 攻击
+            if (base64Data.length > MAX_BASE64_SIZE) {
+                JOptionPane.showMessageDialog(
+                    parent,
+                    "图片数据过大（最大 5MB），无法加载",
+                    "错误",
+                    JOptionPane.ERROR_MESSAGE
+                )
+                return
+            }
+
             try {
                 val cleanBase64 = base64Data
                     .removePrefix("data:image/jpeg;base64,")
@@ -210,7 +224,31 @@ class ImagePreviewDialog(
                     .removePrefix("data:image/gif;base64,")
                     .removePrefix("data:image/webp;base64,")
                     .removePrefix("data:image/bmp;base64,")
+                
+                // 额外的长度检查（解码前）
+                if (cleanBase64.length > MAX_BASE64_SIZE) {
+                    JOptionPane.showMessageDialog(
+                        parent,
+                        "图片数据过大，无法加载",
+                        "错误",
+                        JOptionPane.ERROR_MESSAGE
+                    )
+                    return
+                }
+
                 val imageBytes = Base64.getDecoder().decode(cleanBase64)
+                
+                // 解码后再次检查
+                if (imageBytes.size > MAX_BASE64_SIZE) {
+                    JOptionPane.showMessageDialog(
+                        parent,
+                        "图片文件过大，无法加载",
+                        "错误",
+                        JOptionPane.ERROR_MESSAGE
+                    )
+                    return
+                }
+
                 val image = Toolkit.getDefaultToolkit().createImage(imageBytes)
                 // 确保图片加载完成
                 val tracker = MediaTracker(java.awt.Panel())

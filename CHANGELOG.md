@@ -2,6 +2,52 @@
 
 ## 版本发布记录
 
+### v1.1.2 (2026-05-17)
+
+**SSE 流解析增强**
+- ✅ `SseStreamParser` 新增日志追踪，改进 `hermes.tool.progress` 事件解析
+- ✅ 工具调用 ID 缺失时使用 UUID 回退（BUG-005 修复）
+- ✅ `finally` 块显式状态清理，处理流意外中断（BUG-004 修复）
+
+**API 客户端增强**
+- ✅ `HermesApiClient` 连接超时 30s → 60s，HTTP/1.1 优化 SSE 性能
+- ✅ HTTP 请求异常捕获，统一抛出 `HermesApiException`
+- ✅ 错误响应体日志脱敏（>200 字符截断，生产环境不记录完整 body）
+- ✅ SSE 流中断 `IOException` 显式日志记录
+
+**对话服务重构**
+- ✅ `HermesChatService` 引入 `ToolCallStateMachine` 集中管理工具调用状态
+- ✅ 会话 ID 校验：`SessionSecurityValidator.validateSessionId()` 验证后保存
+- ✅ 错误消息中文本地化，细化 HTTP 状态码分类（413/502-504）
+- ✅ 所有 UI 更新通过 `withContext(Dispatchers.Main)` 确保线程安全
+- ✅ `CancellationException` 不显示错误提示，避免用户困惑
+
+**会话管理优化**
+- ✅ `ConversationManager.createConversation()` 新对话不继承 `hermesSessionId`
+- ✅ `deleteConversation()` 智能删除：仅当无其他对话使用该会话时才调用服务端删除
+
+**安全加固**
+- ✅ `CodeBlockPanel` 插入/新建文件前调用 `CodeSecurityValidator` 验证代码和文件名
+- ✅ `ImagePreviewDialog` Base64 数据 5MB 大小限制，解码前后双重检查（防 DoS）
+
+**构建修复**
+- ✅ `build.gradle.kts` 排除重复目录 `com/hermes/model/**`（避免 Conversation.kt 重复编译）
+- ✅ `build.gradle.kts` 禁用 `buildSearchableOptions` 修复 WSL2 构建失败
+
+**工具调用取消支持**
+- ✅ 新增 `cancelToolCall()` 方法实现，修复编译错误 `Unresolved reference: cancelToolCall`
+- ✅ 取消逻辑：找到最后一个未完成的工具调用，标记为 `cancelled = true, status = "Cancelled"`
+
+**UI 细节优化**
+- ✅ `MessageBubble.createActionButton()` 显式设置 `this.text = ""`
+- ✅ `MessageBubble` 头像图标缩放比例 1.5（13px × 1.5 ≈ 19.5px）
+
+**构建状态**
+- ✅ 编译通过：`BUILD SUCCESSFUL in 17s`，16 个任务全部执行
+- ✅ 插件包生成位置：`build/distributions/`
+
+---
+
 ### v1.1.1 (2026-05-15)
 
 **SSE 流解析增强**
@@ -183,20 +229,42 @@
 **影响文件**: `services/ConversationStore.kt`, `services/ConversationManager.kt`  
 **状态**: ✅ 已修复
 
+### Bug #14: 编译错误 Unresolved reference: cancelToolCall
+**问题**: `MessageListPanel.kt:246:26 Unresolved reference: cancelToolCall`  
+**根因**: `MessageBubble.kt` 缺少 `cancelToolCall` 方法实现  
+**修复方案**: 在 `MessageBubble.kt` 的 `completeToolCall()` 方法后添加 `cancelToolCall()` 方法实现  
+**影响文件**: `toolwindow/MessageBubble.kt`  
+**状态**: ✅ 已修复
+
+### Bug #15: 按钮显示文字
+**问题**: 操作按钮显示文字而非仅图标  
+**根因**: `createActionButton()` 未清除按钮文本  
+**修复方案**: 显式设置 `this.text = ""`  
+**影响文件**: `toolwindow/MessageBubble.kt`  
+**状态**: ✅ 已修复
+
+### Bug #16: 头像图标缩放过大
+**问题**: 头像图标在圆圈内显示过大，超出边界  
+**根因**: 图标缩放比例 2.0 导致 13px × 2 = 26px，超出 24px 圆圈  
+**修复方案**: 缩放比例调整为 1.5（13px × 1.5 ≈ 19.5px）  
+**影响文件**: `toolwindow/MessageBubble.kt`  
+**状态**: ✅ 已修复
+
 ---
 
 ## 修复统计
 
 | 类别 | 数量 |
 |------|------|
-| UI 渲染 | 4 |
+| UI 渲染 | 6 |
 | 粘贴功能 | 4 |
 | 数据持久化 | 3 |
 | API 通信 | 1 |
 | 状态管理 | 1 |
 | 存储优化 | 1 |
-| **总计** | **13** |
+| 编译错误 | 1 |
+| **总计** | **17** |
 
 ---
 
-*最后更新：2026-05-15*
+*最后更新：2026-05-17*
